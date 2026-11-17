@@ -6,6 +6,7 @@ use mago_syntax::walker::Walker;
 impl<'a, 'arena> Walker<'a, 'arena, State> for Collector<'_, '_> {
     fn walk_in_class(&self, n: &Class<'arena>, s: &mut State) {
         s.container = Some(super::lossy(n.name.value));
+        s.callable_props.clear();
         self.collect_properties(&n.members, s);
         s.resolver.enter_container(
             s.container.as_deref().unwrap_or(""),
@@ -26,6 +27,7 @@ impl<'a, 'arena> Walker<'a, 'arena, State> for Collector<'_, '_> {
     }
     fn walk_in_interface(&self, n: &Interface<'arena>, s: &mut State) {
         s.container = Some(super::lossy(n.name.value));
+        s.callable_props.clear();
         self.collect_properties(&n.members, s);
         s.resolver
             .enter_container(s.container.as_deref().unwrap_or(""), vec![])
@@ -36,6 +38,7 @@ impl<'a, 'arena> Walker<'a, 'arena, State> for Collector<'_, '_> {
     }
     fn walk_in_trait(&self, n: &Trait<'arena>, s: &mut State) {
         s.container = Some(super::lossy(n.name.value));
+        s.callable_props.clear();
         self.collect_properties(&n.members, s);
         s.resolver
             .enter_container(s.container.as_deref().unwrap_or(""), vec![])
@@ -46,6 +49,7 @@ impl<'a, 'arena> Walker<'a, 'arena, State> for Collector<'_, '_> {
     }
     fn walk_in_enum(&self, n: &Enum<'arena>, s: &mut State) {
         s.container = Some(super::lossy(n.name.value));
+        s.callable_props.clear();
         self.collect_properties(&n.members, s);
         s.resolver
             .enter_container(s.container.as_deref().unwrap_or(""), vec![])
@@ -58,6 +62,7 @@ impl<'a, 'arena> Walker<'a, 'arena, State> for Collector<'_, '_> {
         s.anon.enter(n, &mut s.container, &s.caller);
         // a referencia itt a property-típusokat a névtelen osztályéra cseréli, és kilépéskor nem állítja vissza
         s.tracker.clear_properties();
+        s.callable_props.clear();
         self.collect_properties(&n.members, s);
     }
     fn walk_out_anonymous_class(&self, _: &AnonymousClass<'arena>, s: &mut State) {
@@ -117,7 +122,9 @@ impl<'a, 'arena> Walker<'a, 'arena, State> for Collector<'_, '_> {
         }
     }
     fn walk_in_assignment(&self, n: &Assignment<'arena>, s: &mut State) {
-        self.register_local_closure(s, n);
+        if n.operator.is_assign() {
+            self.register_callable_assignment(s, n.lhs, n.rhs);
+        }
         if !n.operator.is_assign() {
             return;
         }
@@ -156,6 +163,8 @@ impl<'a, 'arena> Walker<'a, 'arena, State> for Collector<'_, '_> {
             s.calls[x].args = self.args(&n.argument_list);
             // `call_user_func($x)`, `app($var)`… — a hívás marad, mellé a dinamikus jelölés
             self.dynamic_named_function(s, n, &name);
+            // `array_map('trim', …)`, `usort($a, [$this, 'cmp'])`: аргумент-callable — это ссылка
+            self.callable_args(s, &n.argument_list, Self::is_higher_order(&name));
         } else {
             // `$fn(...)`, `$handlers['k'](...)`: változó / kifejezés a hívott
             self.dynamic_callee(s, n);
@@ -182,6 +191,7 @@ impl<'a, 'arena> Walker<'a, 'arena, State> for Collector<'_, '_> {
                 s.calls[x].resolved = Some(format!("{ty}::{}", super::lossy(m.value)));
             }
             s.calls[x].args = self.args(&n.argument_list);
+            self.callable_args(s, &n.argument_list, false);
             self.dynamic_container_make(s, n, n.object, m.value, &n.argument_list);
         } else {
             // `$obj->$m()`, `$obj->{$expr}()`: a metódusnév futásidőben dől el
@@ -189,25 +199,55 @@ impl<'a, 'arena> Walker<'a, 'arena, State> for Collector<'_, '_> {
             self.push_dynamic(s, n, &text);
         }
     }
-    /// Első osztályú callable (`$this->m(...)`): a referencia sima `method_call`-ként rögzíti, argumentumok nélkül.
+    /// Callable первого класса (`$this->m(...)`): ссылка (`callable_use`), а не вызов — метод не выполняется.
     fn walk_in_method_partial_application(
         &self,
         n: &MethodPartialApplication<'arena>,
         s: &mut State,
     ) {
-        if let ClassLikeMemberSelector::Identifier(m) = &n.method {
-            let x = self.push(s, n, "method_call", super::lossy(m.value));
-            s.calls[x].on = Some(match super::strip(n.object) {
-                Expression::Variable(Variable::Direct(v)) if v.name == b"$this" => "this".into(),
-                Expression::Variable(Variable::Direct(v)) => super::lossy(v.name),
-                _ => "<expr>".into(),
-            });
-            if let Some(ty) = self.set_receiver_type(s, n.object) {
-                s.calls[x].resolved = Some(format!("{ty}::{}", super::lossy(m.value)));
+        if !n.argument_list.is_first_class_callable() {
+            return;
+        }
+        match self.partial_callable(s, &PartialApplication::Method(n.clone())) {
+            Some(t) => self.push_callable_ref(s, n, &t),
+            None => {
+                let text = self.span_text(n.object, &n.method);
+                self.push_dynamic(s, n, &text);
             }
-        } else {
-            let text = self.span_text(n.object, &n.method);
-            self.push_dynamic(s, n, &text);
+        }
+    }
+    /// `foo(...)`: ссылка на callable первого класса.
+    fn walk_in_function_partial_application(
+        &self,
+        n: &FunctionPartialApplication<'arena>,
+        s: &mut State,
+    ) {
+        if !n.argument_list.is_first_class_callable() {
+            return;
+        }
+        match self.partial_callable(s, &PartialApplication::Function(n.clone())) {
+            Some(t) => self.push_callable_ref(s, n, &t),
+            None => {
+                let text = self.parsed.text(n.function.span());
+                self.push_dynamic(s, n, &text);
+            }
+        }
+    }
+    /// `Foo::m(...)`: ссылка на callable первого класса.
+    fn walk_in_static_method_partial_application(
+        &self,
+        n: &StaticMethodPartialApplication<'arena>,
+        s: &mut State,
+    ) {
+        if !n.argument_list.is_first_class_callable() {
+            return;
+        }
+        match self.partial_callable(s, &PartialApplication::StaticMethod(n.clone())) {
+            Some(t) => self.push_callable_ref(s, n, &t),
+            None => {
+                let text = self.span_text(n.class, &n.method);
+                self.push_dynamic(s, n, &text);
+            }
         }
     }
     fn walk_in_null_safe_method_call(&self, n: &NullSafeMethodCall<'arena>, s: &mut State) {
@@ -230,7 +270,8 @@ impl<'a, 'arena> Walker<'a, 'arena, State> for Collector<'_, '_> {
             if let Some(ty) = self.set_receiver_type(s, n.object) {
                 s.calls[x].resolved = Some(format!("{ty}::{}", super::lossy(m.value)));
             }
-            s.calls[x].args = self.args(&n.argument_list)
+            s.calls[x].args = self.args(&n.argument_list);
+            self.callable_args(s, &n.argument_list, false);
         } else {
             let text = self.span_text(n.object, &n.method);
             self.push_dynamic(s, n, &text);
@@ -247,13 +288,17 @@ impl<'a, 'arena> Walker<'a, 'arena, State> for Collector<'_, '_> {
             let m = super::lossy(name.value);
             let x = self.push(s, n, "static_call", format!("{}::{m}", shown(&c)));
             s.calls[x].resolved = Some(format!("{}::{m}", s.resolver.resolve_class(&c)));
-            s.calls[x].args = self.args(&n.argument_list)
+            s.calls[x].args = self.args(&n.argument_list);
+            self.callable_args(s, &n.argument_list, false);
         }
     }
     fn walk_in_instantiation(&self, n: &Instantiation<'arena>, s: &mut State) {
         if let Some(c) = self.class(n.class) {
             let x = self.push(s, n, "new", shown(&c).to_string());
-            s.calls[x].resolved = Some(s.resolver.resolve_class(&c))
+            s.calls[x].resolved = Some(s.resolver.resolve_class(&c));
+            if let Some(list) = &n.argument_list {
+                self.callable_args(s, list, false);
+            }
         } else {
             // `new $class(...)`, `new $obj->prop(...)`: az osztály futásidőben dől el
             self.dynamic_new(s, n);

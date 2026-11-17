@@ -92,6 +92,10 @@ calls through its interface / parent / trait), so it can miss callers; use it to
 PHP receiver types come from `new Foo()`, `Foo::create()`, typed parameters / properties and the Laravel container:
 `$x = app(Foo::class)` (also `resolve()`, `app()->make()`, `$this->app->make()`, `App::make()`) and the chained
 `app(Foo::class)->bar()` resolve to `Foo::bar`; a string id (`app('foo')`) does not.
+PHP callables are references, not calls: `'strlen'`, `'Foo::bar'`, `[$this, 'm']`, `[Foo::class, 'm']`,
+`Closure::fromCallable(...)` and first-class `$this->m(...)` become `callable_use` edges (find them with
+`--category callable_use`, or by the method name with `--grep`); a callable stored in a variable or property
+(`$f = 'strlen'; $f('x')`, `$this->cb = [$this, 'm']`) resolves to a real call instead of `dynamic_call`.
 
 <!-- mcp:output -->
 **Reading search output** (`--grep`, `--depth`, `--strings`, `--const`, directories):

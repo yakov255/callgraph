@@ -1,5 +1,6 @@
 //! A kategória-szabályok (egy fájl = egy szabály).
 
+mod callable_use;
 mod component_use;
 mod dynamic_call;
 mod external_call;
@@ -14,6 +15,7 @@ mod native_php;
 mod orm_relation;
 mod static_call;
 
+pub use callable_use::CallableUseRule;
 pub use component_use::ComponentUseRule;
 pub use dynamic_call::DynamicCallRule;
 pub use external_call::ExternalCallRule;
@@ -33,6 +35,7 @@ use super::CategoryRule;
 /// Az alapértelmezett sorrend (a konkrétabb szabály elöl).
 pub fn default_rules() -> Vec<Box<dyn CategoryRule>> {
     vec![
+        Box::new(CallableUseRule),
         Box::new(DynamicCallRule),
         Box::new(OrmRelationRule),
         Box::new(InternalHelperRule),

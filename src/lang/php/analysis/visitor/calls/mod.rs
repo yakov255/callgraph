@@ -1,5 +1,6 @@
 //! Hívások gyűjtése és kategorizálása.
 
+mod callable;
 mod dynamic;
 mod helpers;
 mod state;

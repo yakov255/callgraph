@@ -93,6 +93,10 @@ az interfészén / szülőjén / trait-jén át menőket), ezért hívók maradh
 A PHP-fogadó típusa a `new Foo()`-ból, a `Foo::create()`-ből, a típusos paraméterből / property-ből és a Laravel-
 konténerből jön: a `$x = app(Foo::class)` (a `resolve()`, `app()->make()`, `$this->app->make()`, `App::make()` is) és
 a láncolt `app(Foo::class)->bar()` `Foo::bar`-ra oldódik; a sztring-azonosító (`app('foo')`) nem.
+A PHP callable-hivatkozás, nem hívás: a `'strlen'`, `'Foo::bar'`, `[$this, 'm']`, `[Foo::class, 'm']`,
+`Closure::fromCallable(...)` és az első osztályú `$this->m(...)` `callable_use` él lesz (`--category callable_use`,
+vagy a metódus nevére `--grep`); a változóban / property-ben tartott callable (`$f = 'strlen'; $f('x')`,
+`$this->cb = [$this, 'm']`) valódi hívásként oldódik fel `dynamic_call` helyett.
 
 <!-- mcp:output -->
 **A keresőkimenet olvasása** (`--grep`, `--depth`, `--strings`, `--const`, mappák):

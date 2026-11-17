@@ -76,7 +76,9 @@ $ callgraph.sh --project shop app --grep saveTranslations --depth 2
 - **Kategorizált hívás-gráf.** Minden hívás besorolást kap: `native_php`, `orm_relation`, `model_use`, `global_helper`,
   `internal_helper`, `external_call`, `framework_use`, Vue `composable_use` és még több — az agent a szándékot látja,
   nem csak neveket. A futásidőben eldőlő célú hívásokat (`$this->$method()`, `obj[key]()`, `getattr(obj, név)()`)
-  `dynamic_call` jelöli, nem tűnnek el csendben.
+  `dynamic_call` jelöli, nem tűnnek el csendben. A callable-hivatkozások (`'strlen'`, `[$this, 'm']`,
+  `Closure::fromCallable(...)`, első osztályú `$this->m(...)`) `callable_use` élként megmaradnak, a változóban /
+  property-ben tartott callable pedig a `$fn()` hívásnál feloldódik.
 - **„Ki hívja?” és hatáselemzés.** A `--grep <minta> --depth N` a hívók hívóit járja be az egész projektben, cache-elt,
   inkrementális projektindexszel.
 - **Célzott olvasás.** A `fájl::metódus --body` csak azt a metódust írja ki, sorszámozva; a `--lines 30-60` bármely sávot.

@@ -217,6 +217,119 @@ fn full_dynamic(src: &str) -> Vec<String> {
         .collect()
 }
 
+/// Ссылки `callable_use` (цель, разрешение) по порядку.
+fn callable_refs(src: &str) -> Vec<(String, Option<String>)> {
+    full(src)
+        .into_iter()
+        .filter(|c| c.category == "callable_use")
+        .map(|c| (c.target, c.resolved))
+        .collect()
+}
+
+#[test]
+fn string_callable_assignment_resolves_the_call() {
+    let src = "<?php\nclass A {\n  function f() { $fn = 'strlen'; $fn('x'); }\n}\n";
+    let all = full(src);
+    assert!(all.iter().all(|c| c.category != "dynamic_call"), "{all:?}");
+    assert_eq!(
+        callable_refs(src),
+        vec![("strlen".to_string(), Some("strlen".to_string()))]
+    );
+    let call = all
+        .iter()
+        .find(|c| c.kind == "func_call" && c.target == "strlen" && c.on.as_deref() == Some("$fn"))
+        .expect("resolved invocation");
+    assert_eq!(call.resolved.as_deref(), Some("strlen"));
+}
+
+#[test]
+fn array_callable_assignment_resolves_the_call() {
+    let src = "<?php\nclass A {\n  function run($x) {}\n  function f() { $fn = [$this, 'run']; $fn(1); }\n}\n";
+    let all = full(src);
+    assert!(all.iter().all(|c| c.category != "dynamic_call"), "{all:?}");
+    assert_eq!(
+        callable_refs(src),
+        vec![("run".to_string(), Some("A::run".to_string()))]
+    );
+    let call = all
+        .iter()
+        .find(|c| c.kind == "method_call" && c.target == "run" && c.on.as_deref() == Some("$fn"))
+        .expect("resolved invocation");
+    assert_eq!(call.resolved.as_deref(), Some("A::run"));
+}
+
+#[test]
+fn callable_arguments_are_recorded_as_references() {
+    let src = "<?php\nclass A {\n  function run($x) {}\n  function f($a) {\n    array_map([$this, 'run'], $a);\n    usort($a, 'cmp');\n    assertSame('x', $a);\n  }\n}\n";
+    let all = full(src);
+    assert_eq!(
+        callable_refs(src),
+        vec![
+            ("run".to_string(), Some("A::run".to_string())),
+            ("cmp".to_string(), Some("cmp".to_string())),
+        ]
+    );
+    // строка из `assertSame('x', …)` — не callable
+    assert!(
+        all.iter()
+            .filter(|c| c.category == "callable_use")
+            .all(|c| c.target != "x")
+    );
+}
+
+#[test]
+fn property_callable_is_resolved_across_methods() {
+    let src = "<?php\nclass A {\n  private $cb;\n  function run($x) {}\n  function init() { $this->cb = [$this, 'run']; }\n  function f() { ($this->cb)(1); }\n}\n";
+    let all = full(src);
+    assert!(all.iter().all(|c| c.category != "dynamic_call"), "{all:?}");
+    let call = all
+        .iter()
+        .find(|c| c.target == "run" && c.on.as_deref() == Some("this->cb"))
+        .expect("property invocation");
+    assert_eq!(call.resolved.as_deref(), Some("A::run"));
+}
+
+#[test]
+fn closure_from_callable_and_static_string_are_references() {
+    let src = "<?php\nclass A {\n  function run($x) {}\n  function f() {\n    Closure::fromCallable([$this, 'run']);\n    $cb = 'Foo::bar';\n  }\n}\n";
+    assert_eq!(
+        callable_refs(src),
+        vec![
+            ("run".to_string(), Some("A::run".to_string())),
+            ("bar".to_string(), Some("Foo::bar".to_string())),
+        ]
+    );
+}
+
+#[test]
+fn first_class_callable_argument_is_a_reference() {
+    let src = "<?php\nclass A {\n  function run($x) {}\n  function f($a) { array_map($this->run(...), $a); }\n}\n";
+    assert_eq!(
+        callable_refs(src),
+        vec![("run".to_string(), Some("A::run".to_string()))]
+    );
+    let all = full(src);
+    assert_eq!(
+        all.iter().filter(|c| c.target == "run").count(),
+        1,
+        "{all:?}"
+    );
+}
+
+#[test]
+fn plain_string_assignment_is_not_a_callable() {
+    let src = "<?php\nclass A {\n  function f() { $status = 'active'; $status(); }\n}\n";
+    assert!(callable_refs(src).is_empty(), "{:?}", callable_refs(src));
+    assert_eq!(full_dynamic(src), vec!["$status"]);
+}
+
+#[test]
+fn reassignment_to_a_non_callable_makes_the_call_dynamic_again() {
+    let src =
+        "<?php\nclass A {\n  function f($obj) { $fn = 'strlen'; $fn = $obj->get(); $fn(1); }\n}\n";
+    assert_eq!(full_dynamic(src), vec!["$fn"]);
+}
+
 #[test]
 fn closure_and_callable_parameters_are_callbacks_not_dynamic() {
     for hint in [

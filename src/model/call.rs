@@ -8,8 +8,9 @@ pub const DYNAMIC_CALL: &str = "dynamic_call";
 /// Az összes ismert hívás-kategória (a nyelvi frontendek kategorizálóinak közös listája): a `--category` ellenőrzése
 /// és az „ismeretlen kategória” hibaüzenet ebből jön. Ábécében, a `dynamic_call` a végén (`category_rank`).
 /// Új kategória a frontendben: ide is fel kell venni — a `known_categories_cover_every_frontend` teszt őrzi.
-pub const KNOWN_CATEGORIES: [&str; 41] = [
+pub const KNOWN_CATEGORIES: [&str; 42] = [
     "anchor",
+    "callable_use",
     "component_use",
     "composable_use",
     "extend",

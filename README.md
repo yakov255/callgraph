@@ -76,7 +76,9 @@ $ callgraph.sh --project shop app --grep saveTranslations --depth 2
 - **Categorized call graph.** Every call is classified: `native_php`, `orm_relation`, `model_use`, `global_helper`,
   `internal_helper`, `external_call`, `framework_use`, Vue `composable_use` and more, so the agent sees intent,
   not just names. Calls whose target is decided at runtime (`$this->$method()`, `obj[key]()`, `getattr(obj, name)()`)
-  are marked `dynamic_call` instead of silently missing.
+  are marked `dynamic_call` instead of silently missing. Callable references (`'strlen'`, `[$this, 'm']`,
+  `Closure::fromCallable(...)`, first-class `$this->m(...)`) are kept as `callable_use` edges, and a callable held in a
+  variable or property is resolved at `$fn()`.
 - **"Who calls this?" and impact analysis.** `--grep <pattern> --depth N` walks callers of callers across the whole
   project using a cached, incremental project index.
 - **Surgical reads.** `file::method --body` prints just that method, line-numbered; `--lines 30-60` prints any range.

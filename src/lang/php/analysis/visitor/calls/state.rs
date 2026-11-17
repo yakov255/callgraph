@@ -5,7 +5,16 @@ use crate::lang::php::{
     framework::{FrameworkStrategy, GenericStrategy},
 };
 use crate::model::Call;
-use std::{collections::HashSet, rc::Rc};
+use std::{collections::HashMap, collections::HashSet, rc::Rc};
+
+/// Статически известная цель ссылки на callable (`'strlen'`, `'Foo::bar'`, `[$this,'m']`, `Foo::m(...)`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CallableTarget {
+    /// Вид при вызове: `func_call` / `method_call` / `static_call`.
+    pub(super) kind: &'static str,
+    pub(super) target: String,
+    pub(super) resolved: Option<String>,
+}
 
 pub(super) struct State {
     pub(super) container: Option<String>,
@@ -18,8 +27,11 @@ pub(super) struct State {
     pub(super) framework: Rc<dyn FrameworkStrategy>,
     pub(super) chain: CategoryChain,
     pub(super) calls: Vec<Call>,
-    /// A függvény hívható változói (`Closure` / `callable` paraméter, closure-literál értékadás): a `$var()` nem dinamikus.
-    pub(super) callables: HashSet<String>,
+    /// Вызываемые переменные функции (`$f`) → цель ссылки. `None`: известный callable без цели
+    /// (closure-литерал, параметр `Closure` / `callable`) — `$var()` тогда не динамический, но ребра нет.
+    pub(super) callables: HashMap<String, Option<CallableTarget>>,
+    /// Callable-property уровня класса (`$this->cb = …`) → цель ссылки; переживает переход между методами.
+    pub(super) callable_props: HashMap<String, Option<CallableTarget>>,
 }
 
 impl Default for State {
@@ -35,7 +47,8 @@ impl Default for State {
             framework: Rc::new(GenericStrategy),
             chain: CategoryChain::with_defaults(),
             calls: Vec::new(),
-            callables: HashSet::new(),
+            callables: HashMap::new(),
+            callable_props: HashMap::new(),
         }
     }
 }

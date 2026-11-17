@@ -1,7 +1,7 @@
 //! Hívás-kategorizálás (Chain of Responsibility): a szabályok sorban futnak, az első illeszkedő dönt.
 
 mod chain;
-mod data;
+pub(crate) mod data;
 mod rule;
 pub mod rules;
 

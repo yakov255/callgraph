@@ -57,20 +57,82 @@ impl Collector<'_, '_> {
         self.parsed.text(from.span().join(to.span()))
     }
 
-    /// Függvényhívás: nem azonosító hívott kifejezés (`$fn(...)`, `$a['k'](...)`, `foo()(...)`) — a closure-
-    /// literál közvetlen hívása (`(function () {})()`) nem dinamikus.
+    /// Вызов функции: вызываемое выражение — не идентификатор (`$fn(...)`, `$a['k'](...)`, `foo()(...)`) —
+    /// прямой вызов closure-литерала (`(function () {})()`) не динамический. Для известной callable-переменной /
+    /// property создаётся реальное ребро вызова к разрешённой цели.
     pub(super) fn dynamic_callee(&self, s: &mut State, n: &FunctionCall<'_>) {
         match super::strip(n.function) {
             Expression::Identifier(_) | Expression::Closure(_) | Expression::ArrowFunction(_) => {}
-            // `$next($r)`, ahol a `$next` Closure / callable paraméter vagy helyi closure: callback, nem dinamikus
-            Expression::Variable(Variable::Direct(v)) if s.callables.contains(&lossy(v.name)) => {}
-            // `($this->prop)(…)`: osztály-típusú property → statikusan ismert `__invoke` hívás
-            Expression::Access(Access::Property(p)) if self.invokable_property(s, n, p) => {}
+            // `$next($r)`, где `$next` — параметр Closure / callable или известная callable-переменная
+            Expression::Variable(Variable::Direct(v)) => {
+                let name = lossy(v.name);
+                match s.callables.get(&name) {
+                    Some(Some(target)) => {
+                        let target = target.clone();
+                        self.push_callable_invocation(s, n, &target, Some(name));
+                    }
+                    // известный callable без цели (closure / параметр `callable`): callback, не динамический
+                    Some(None) => {}
+                    None => {
+                        let text = self.parsed.text(n.function.span());
+                        self.push_dynamic(s, n, &text);
+                    }
+                }
+            }
+            // `($this->prop)(…)`: известный callable property → реальный вызов; property типа класс → `__invoke`
+            Expression::Access(Access::Property(p)) => match self.callable_property(s, p) {
+                Some(Some(target)) => {
+                    let key = self.property_key(p);
+                    self.push_callable_invocation(s, n, &target, key);
+                }
+                Some(None) => {}
+                None => {
+                    if !self.invokable_property(s, n, p) {
+                        let text = self.parsed.text(super::strip(n.function).span());
+                        self.push_dynamic(s, n, &text);
+                    }
+                }
+            },
             other => {
                 let text = self.parsed.text(other.span());
                 self.push_dynamic(s, n, &text);
             }
         }
+    }
+
+    /// Известный callable property (`$this->cb = [$this, 'm']`): `Some(Some(цель))`; известный без цели
+    /// (`Closure` / `callable`): `Some(None)`; неизвестный: `None`.
+    fn callable_property(
+        &self,
+        s: &State,
+        p: &PropertyAccess<'_>,
+    ) -> Option<Option<super::state::CallableTarget>> {
+        let key = self.property_key(p)?;
+        s.callable_props.get(&key).cloned()
+    }
+
+    /// `$this->cb` → `this->cb` (только для `$this`).
+    fn property_key(&self, p: &PropertyAccess<'_>) -> Option<String> {
+        let (Expression::Variable(Variable::Direct(v)), ClassLikeMemberSelector::Identifier(i)) =
+            (super::strip(p.object), &p.property)
+        else {
+            return None;
+        };
+        (v.name == b"$this").then(|| format!("this->{}", lossy(i.value)))
+    }
+
+    /// Ребро вызова callable: разрешённая цель и имя вызванной переменной / property.
+    fn push_callable_invocation(
+        &self,
+        s: &mut State,
+        n: &FunctionCall<'_>,
+        t: &super::state::CallableTarget,
+        on: Option<String>,
+    ) {
+        let x = self.push(s, n, t.kind, t.target.clone());
+        s.calls[x].resolved = t.resolved.clone();
+        s.calls[x].on = on;
+        s.calls[x].args = self.args(&n.argument_list);
     }
 
     /// `($this->prop)(…)` osztály- / interfész-típusú property-n: felveszi a `Típus::__invoke` method_call-t és
@@ -126,23 +188,8 @@ impl Collector<'_, '_> {
                 .map(|t| t.trim().trim_start_matches('\\').to_ascii_lowercase())
                 .any(|t| t == "closure" || t == "callable");
             if callable {
-                s.callables.insert(lossy(p.variable.name));
+                s.callables.insert(lossy(p.variable.name), None);
             }
-        }
-    }
-
-    /// `$var = function (…) {…}` / `fn (…) => …` / `static fn …`: helyi closure.
-    pub(super) fn register_local_closure(&self, s: &mut State, n: &Assignment<'_>) {
-        if !n.operator.is_assign() {
-            return;
-        }
-        if let Expression::Variable(Variable::Direct(v)) = super::strip(n.lhs)
-            && matches!(
-                super::strip(n.rhs),
-                Expression::Closure(_) | Expression::ArrowFunction(_)
-            )
-        {
-            s.callables.insert(lossy(v.name));
         }
     }
 
