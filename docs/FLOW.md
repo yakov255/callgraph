@@ -152,6 +152,25 @@ Mivel ezek may-only közelítések, hamis pozitívumot adhatnak: pl. a `$row->na
 - A `switch` exhaustiveness csak `default`-ból jön; enum-/literál-domén kimerülését nem számoljuk.
 - A `match` `must`-ja csak teljesen azonos ág-must-halmazoknál adódik (szigorú konzervatív szabály).
 
+## SQL-parsing (MySQL 8.4)
+
+A `flow` a `fetch*` / `query*` / `execute*` hívások első argumentumából (literál vagy ismert string-változó,
+heredoc is) kiolvassa a SELECT-et `sqlparser`-rel (`MySqlDialect`), és a `$row['oszlop']` olvasást
+`sql:<tábla>.<oszlop>` atommá köti. Így a `trace <tábla>.<oszlop>` akkor is működik, ha nincs `.callgraph-flow.json`
+mapping (a séma/backtick levágva, az aliasok azonos nevűek).
+
+```
+trace: api_queue.queue.service_type · 3 reads in 3 files
+src/Repository/QueueRepository.php  ...::makeEntity  L270
+  $row['service_type']
+  sql:api_queue.queue.service_type → key:service_type → row:api_queue.queue
+```
+
+Korlátok: dinamikus SQL (`{$x}`, `%s`, `VALUES $x`, `IN :ids`) előfeldolgozás után is sokszor törhető → ilyenkor
+csak `key:` marad; `SELECT *` esetén a tábla ismert, a kolónia nem; alias (`AS st`) és CTE/derived table
+feloldása még hiányos; `sqlparser` szintaxis, nem séma. A core teljes scanje ~2 perc (a `trace` opt-in parancs),
+a queue ~0,1 s.
+
 ## Külső plugin (bármilyen nyelven)
 
 A parancs **egyszer** fut le projektenként: a stdin-en megkapja az összes osztály JSON-ját, a stdout-ra a
