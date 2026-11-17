@@ -19,7 +19,7 @@ use rayon::prelude::*;
 pub use index::Index;
 pub use literal::Value;
 pub use model::{ArgEdge, Assign, FlowFile, MethodFlow, Read, Trace};
-pub use plugin::{ColumnRef, Config, FlowHandler, Mapping, Registry};
+pub use plugin::{ClassTableHandler, ColumnRef, Config, Mapping, PropertyColumnHandler, Registry};
 
 use crate::error::Result;
 use crate::io::FileWalker;

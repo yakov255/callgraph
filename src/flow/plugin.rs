@@ -7,7 +7,8 @@
 //! - правила `hydrate` в `.callgraph-flow.json`: декларативное сопоставление для объектов, заполняемых вне AST
 //!   (JsonMapper, Symfony Serializer, Doctrine): класс, таблица и `property → column`;
 //! - правила `map` в `.callgraph-flow.json`: ручное переопределение, всегда высший приоритет;
-//! - собственный скомпилированный обработчик: реализация трейта `FlowHandler`, зарегистрированная в `Registry`.
+//! - собственный скомпилированный обработчик: реализация `ClassTableHandler` (таблица класса) или
+//!   `PropertyColumnHandler` (колонки property), зарегистрированная в `Registry`.
 //!
 //! Результат (`Mapping`) — вход для будущего графа потока данных: `(класс, property) → таблица.колонка`.
 
@@ -82,11 +83,25 @@ impl Mapping {
     }
 }
 
-/// Компилируемый обработчик: дополняет сопоставление по каждому классу.
-pub trait FlowHandler: Send + Sync {
+/// Компилируемый обработчик таблиц: добавляет таблицу класса.
+///
+/// Обработчик возвращает ровно один факт — `класс → таблица`; колонки добавляет `PropertyColumnHandler`.
+pub trait ClassTableHandler: Send + Sync {
     fn id(&self) -> &'static str;
-    fn apply(&self, class: &ClassFacts, out: &mut Mapping);
+    fn table(&self, class: &ClassFacts, out: &mut Mapping);
 }
+
+/// Компилируемый обработчик колонок: добавляет `property → column` для класса.
+///
+/// Обработчик возвращает ровно один факт — `(класс, property) → колонка`; таблицу берёт из `Mapping`
+/// или вычисляет сам.
+pub trait PropertyColumnHandler: Send + Sync {
+    fn id(&self) -> &'static str;
+    fn columns(&self, class: &ClassFacts, out: &mut Mapping);
+}
+
+/// Пары `property => column` из `$fieldsMap`.
+type FieldPairs<'a> = &'a [(Option<Value>, Value)];
 
 /// `$tableName` + `$fieldsMap` (legacy ORM, например `Billet`).
 pub struct FieldsMapHandler {
@@ -106,32 +121,80 @@ impl Default for FieldsMapHandler {
     }
 }
 
-impl FlowHandler for FieldsMapHandler {
-    fn id(&self) -> &'static str {
-        "legacy-fields-map"
+impl FieldsMapHandler {
+    const ID: &'static str = "legacy-fields-map";
+
+    /// Обработчик из конфигурации; незаданные имена property остаются по умолчанию.
+    fn from_config(config: &HandlerConfig) -> Self {
+        Self {
+            table_property: config
+                .table_property
+                .clone()
+                .unwrap_or_else(|| "tableName".into()),
+            map_property: config
+                .map_property
+                .clone()
+                .unwrap_or_else(|| "fieldsMap".into()),
+            extends: config.extends.clone(),
+        }
     }
 
-    fn apply(&self, class: &ClassFacts, out: &mut Mapping) {
+    /// Таблица и карта полей класса, если фильтр `extends` пропускает класс.
+    ///
+    /// Оба факта нужны вместе: без `$fieldsMap` таблица не регистрируется (поведение прежнего обработчика).
+    fn fields<'a>(&self, class: &'a ClassFacts) -> Option<(&'a str, FieldPairs<'a>)> {
         if let Some(filter) = &self.extends
             && !class
                 .extends
                 .iter()
                 .any(|e| short_name(e).eq_ignore_ascii_case(short_name(filter)))
         {
-            return;
+            return None;
         }
-        let Some(table) = property_str(class, &self.table_property) else {
+        let table = property_str(class, &self.table_property)?;
+        let map = property_array(class, &self.map_property)?;
+        Some((table, map))
+    }
+
+    /// Пары `(ключ, значение)` карты, пригодные для сопоставления: обе стороны — строки.
+    fn pairs(map: &[(Option<Value>, Value)]) -> impl Iterator<Item = (&str, &str)> {
+        map.iter().filter_map(|(key, value)| {
+            let key = key.as_ref()?.as_str()?;
+            Some((key, value.as_str()?))
+        })
+    }
+}
+
+impl ClassTableHandler for FieldsMapHandler {
+    fn id(&self) -> &'static str {
+        Self::ID
+    }
+
+    fn table(&self, class: &ClassFacts, out: &mut Mapping) {
+        let Some((table, map)) = self.fields(class) else {
             return;
         };
-        let Some(map) = property_array(class, &self.map_property) else {
+        // прежнее поведение: таблица появлялась вместе с первой колонкой, пустая карта таблицу не даёт
+        if Self::pairs(map).next().is_none() {
+            return;
+        }
+        out.tables
+            .entry(class.name.clone())
+            .or_insert_with(|| table.to_owned());
+    }
+}
+
+impl PropertyColumnHandler for FieldsMapHandler {
+    fn id(&self) -> &'static str {
+        Self::ID
+    }
+
+    fn columns(&self, class: &ClassFacts, out: &mut Mapping) {
+        let Some((table, map)) = self.fields(class) else {
             return;
         };
         let declared: HashSet<&str> = class.properties.iter().map(|p| p.name.as_str()).collect();
-        for (key, value) in map {
-            let (Some(key), Some(value)) = (key.as_ref().and_then(Value::as_str), value.as_str())
-            else {
-                continue;
-            };
+        for (key, value) in Self::pairs(map) {
             // `property => column` или `column => property` — решает объявленное property
             let (property, column) = if declared.contains(key) {
                 (key, value)
@@ -140,7 +203,7 @@ impl FlowHandler for FieldsMapHandler {
             } else {
                 (key, value)
             };
-            out.insert(&class.name, property, table, column, self.id());
+            out.insert(&class.name, property, table, column, Self::ID);
         }
     }
 }
@@ -211,7 +274,8 @@ pub struct HandlerConfig {
 
 /// Обработчики и ручные правила.
 pub struct Registry {
-    handlers: Vec<Box<dyn FlowHandler>>,
+    table_handlers: Vec<Box<dyn ClassTableHandler>>,
+    column_handlers: Vec<Box<dyn PropertyColumnHandler>>,
     plugins: Vec<PluginConfig>,
     hydrate: Vec<HydrateRule>,
     manual: Vec<MapRule>,
@@ -225,47 +289,53 @@ impl Registry {
     }
 
     pub fn from_config(config: Config) -> Self {
-        let mut handlers: Vec<Box<dyn FlowHandler>> = Vec::new();
+        let mut table_handlers: Vec<Box<dyn ClassTableHandler>> = Vec::new();
+        let mut column_handlers: Vec<Box<dyn PropertyColumnHandler>> = Vec::new();
         if config.handlers.is_empty() {
-            handlers.push(Box::new(FieldsMapHandler::default()));
+            table_handlers.push(Box::new(FieldsMapHandler::default()));
+            column_handlers.push(Box::new(FieldsMapHandler::default()));
         } else {
             for h in &config.handlers {
-                // неизвестный id: пропускаем (свой обработчик регистрируется в коде, `with_handler`)
+                // неизвестный id: пропускаем (свой обработчик регистрируется в коде, `with_table_handler`)
                 if h.id == "legacy-fields-map" {
-                    handlers.push(Box::new(FieldsMapHandler {
-                        table_property: h
-                            .table_property
-                            .clone()
-                            .unwrap_or_else(|| "tableName".into()),
-                        map_property: h.map_property.clone().unwrap_or_else(|| "fieldsMap".into()),
-                        extends: h.extends.clone(),
-                    }));
+                    table_handlers.push(Box::new(FieldsMapHandler::from_config(h)));
+                    column_handlers.push(Box::new(FieldsMapHandler::from_config(h)));
                 }
             }
         }
         Self {
-            handlers,
+            table_handlers,
+            column_handlers,
             plugins: config.plugins,
             hydrate: config.hydrate,
             manual: config.map,
         }
     }
 
-    /// Добавить свой (скомпилированный) обработчик — перед ручными правилами.
-    pub fn with_handler(mut self, handler: Box<dyn FlowHandler>) -> Self {
-        self.handlers.push(handler);
+    /// Добавить свой (скомпилированный) обработчик таблиц — перед ручными правилами.
+    pub fn with_table_handler(mut self, handler: Box<dyn ClassTableHandler>) -> Self {
+        self.table_handlers.push(handler);
+        self
+    }
+
+    /// Добавить свой (скомпилированный) обработчик колонок — перед ручными правилами.
+    pub fn with_column_handler(mut self, handler: Box<dyn PropertyColumnHandler>) -> Self {
+        self.column_handlers.push(handler);
         self
     }
 
     /// Построить сопоставление.
     ///
-    /// Приоритет: встроенные обработчики, внешние плагины, затем `hydrate` (не перекрывает уже найденное)
-    /// и в конце ручные правила `map` (перекрывают всё).
+    /// Приоритет: встроенные обработчики (сначала таблицы, затем колонки), внешние плагины, затем `hydrate`
+    /// (не перекрывает уже найденное) и в конце ручные правила `map` (перекрывают всё).
     pub fn apply(&self, classes: &[ClassFacts]) -> Mapping {
         let mut mapping = Mapping::default();
         for class in classes {
-            for handler in &self.handlers {
-                handler.apply(class, &mut mapping);
+            for handler in &self.table_handlers {
+                handler.table(class, &mut mapping);
+            }
+            for handler in &self.column_handlers {
+                handler.columns(class, &mut mapping);
             }
         }
         for plugin in &self.plugins {
@@ -468,6 +538,20 @@ mod tests {
     }
 
     #[test]
+    fn empty_fields_map_does_not_add_a_table() {
+        let c = class(
+            "Common\\Empty",
+            vec![
+                prop("tableName", Value::Str("t".into())),
+                prop("fieldsMap", Value::Array(vec![])),
+            ],
+        );
+        let mapping = Registry::from_config(Config::default()).apply(&[c]);
+        assert!(mapping.tables.is_empty());
+        assert!(mapping.columns.is_empty());
+    }
+
+    #[test]
     fn manual_map_overrides_the_handler() {
         let c = class(
             "Common\\HotelChain",
@@ -646,7 +730,13 @@ mod tests {
     fn extends_filter_skips_other_classes() {
         let mut c = class(
             "Other\\Thing",
-            vec![prop("tableName", Value::Str("t".into()))],
+            vec![
+                prop("tableName", Value::Str("t".into())),
+                prop(
+                    "fieldsMap",
+                    Value::Array(vec![(Some(Value::Str("p".into())), Value::Str("c".into()))]),
+                ),
+            ],
         );
         c.extends = vec!["Base".into()];
         let handler = FieldsMapHandler {
@@ -654,7 +744,235 @@ mod tests {
             ..FieldsMapHandler::default()
         };
         let mut mapping = Mapping::default();
-        handler.apply(&c, &mut mapping);
+        PropertyColumnHandler::columns(&handler, &c, &mut mapping);
         assert!(mapping.tables.is_empty());
+        assert!(mapping.columns.is_empty());
+    }
+
+    /// Свой обработчик колонок: ровно один факт `(класс, property) → колонка`.
+    struct FixedColumnHandler {
+        class: &'static str,
+        property: &'static str,
+        table: &'static str,
+        column: &'static str,
+    }
+
+    impl PropertyColumnHandler for FixedColumnHandler {
+        fn id(&self) -> &'static str {
+            "custom-columns"
+        }
+
+        fn columns(&self, class: &ClassFacts, out: &mut Mapping) {
+            if class.name == self.class {
+                out.insert(
+                    &class.name,
+                    self.property,
+                    self.table,
+                    self.column,
+                    self.id(),
+                );
+            }
+        }
+    }
+
+    /// Свой обработчик таблиц: ровно один факт `класс → таблица`.
+    struct FixedTableHandler {
+        class: &'static str,
+        table: &'static str,
+    }
+
+    impl ClassTableHandler for FixedTableHandler {
+        fn id(&self) -> &'static str {
+            "custom-table"
+        }
+
+        fn table(&self, class: &ClassFacts, out: &mut Mapping) {
+            if class.name == self.class {
+                out.tables
+                    .entry(class.name.clone())
+                    .or_insert_with(|| self.table.to_owned());
+            }
+        }
+    }
+
+    /// Обработчик, который ничего не находит.
+    struct NoopHandler;
+
+    impl ClassTableHandler for NoopHandler {
+        fn id(&self) -> &'static str {
+            "noop"
+        }
+
+        fn table(&self, _class: &ClassFacts, _out: &mut Mapping) {}
+    }
+
+    impl PropertyColumnHandler for NoopHandler {
+        fn id(&self) -> &'static str {
+            "noop"
+        }
+
+        fn columns(&self, _class: &ClassFacts, _out: &mut Mapping) {}
+    }
+
+    #[test]
+    fn custom_column_handler_adds_a_column_with_its_id() {
+        let c = class("App\\Thing", vec![]);
+        let registry = Registry::from_config(Config::default()).with_column_handler(Box::new(
+            FixedColumnHandler {
+                class: "App\\Thing",
+                property: "name",
+                table: "thing",
+                column: "name",
+            },
+        ));
+        let mapping = registry.apply(&[c]);
+        let col = mapping
+            .columns
+            .get(&("App\\Thing".to_string(), "name".to_string()))
+            .expect("custom column");
+        assert_eq!(
+            (
+                col.table.as_str(),
+                col.column.as_str(),
+                col.handler.as_str()
+            ),
+            ("thing", "name", "custom-columns")
+        );
+    }
+
+    #[test]
+    fn custom_table_handler_adds_a_table() {
+        let c = class("App\\Thing", vec![]);
+        let registry = Registry::from_config(Config::default()).with_table_handler(Box::new(
+            FixedTableHandler {
+                class: "App\\Thing",
+                table: "thing",
+            },
+        ));
+        let mapping = registry.apply(&[c]);
+        assert_eq!(
+            mapping.tables.get("App\\Thing").map(String::as_str),
+            Some("thing")
+        );
+    }
+
+    #[test]
+    fn noop_handlers_do_not_pollute_the_mapping() {
+        let c = class(
+            "App\\Thing",
+            vec![
+                prop("tableName", Value::Str("t".into())),
+                prop(
+                    "fieldsMap",
+                    Value::Array(vec![(Some(Value::Str("p".into())), Value::Str("c".into()))]),
+                ),
+            ],
+        );
+        // конфигурация без `handlers` регистрирует встроенный обработчик; noop добавляет пустоту
+        let registry = Registry::from_config(Config {
+            handlers: vec![HandlerConfig {
+                id: "legacy-fields-map".into(),
+                ..HandlerConfig::default()
+            }],
+            ..Config::default()
+        })
+        .with_table_handler(Box::new(NoopHandler))
+        .with_column_handler(Box::new(NoopHandler));
+        let mapping = registry.apply(&[c]);
+        // встроенный обработчик находит только то, что объявлено; noop не добавляет ничего
+        assert_eq!(mapping.columns.len(), 1);
+        assert!(mapping.warnings.is_empty());
+        assert_eq!(
+            mapping
+                .columns
+                .get(&("App\\Thing".to_string(), "p".to_string()))
+                .map(|c| c.handler.as_str()),
+            Some("legacy-fields-map")
+        );
+
+        // noop без встроенного обработчика: сопоставление пусто
+        let empty = Registry::from_config(Config {
+            handlers: vec![HandlerConfig {
+                id: "unknown".into(),
+                ..HandlerConfig::default()
+            }],
+            ..Config::default()
+        })
+        .with_table_handler(Box::new(NoopHandler))
+        .with_column_handler(Box::new(NoopHandler))
+        .apply(&[class("App\\Thing", vec![])]);
+        assert!(empty.tables.is_empty());
+        assert!(empty.columns.is_empty());
+    }
+
+    #[test]
+    fn manual_map_overrides_custom_handler() {
+        let registry = Registry::from_config(Config {
+            map: vec![MapRule {
+                class: "Thing".into(),
+                table: Some("manual_table".into()),
+                property: Some("name".into()),
+                column: Some("manual_column".into()),
+            }],
+            ..Config::default()
+        })
+        .with_column_handler(Box::new(FixedColumnHandler {
+            class: "App\\Thing",
+            property: "name",
+            table: "custom_table",
+            column: "custom_column",
+        }));
+        let mapping = registry.apply(&[class("App\\Thing", vec![])]);
+        let col = mapping
+            .columns
+            .get(&("App\\Thing".to_string(), "name".to_string()))
+            .expect("column");
+        assert_eq!(
+            (
+                col.table.as_str(),
+                col.column.as_str(),
+                col.handler.as_str()
+            ),
+            ("manual_table", "manual_column", "manual")
+        );
+    }
+
+    #[test]
+    fn hydrate_does_not_override_custom_handlers() {
+        let registry = Registry::from_config(Config {
+            hydrate: vec![HydrateRule {
+                class: "App\\Thing".into(),
+                table: "wrong".into(),
+                properties: BTreeMap::from([("name".into(), "wrong".into())]),
+            }],
+            ..Config::default()
+        })
+        .with_table_handler(Box::new(FixedTableHandler {
+            class: "App\\Thing",
+            table: "thing",
+        }))
+        .with_column_handler(Box::new(FixedColumnHandler {
+            class: "App\\Thing",
+            property: "name",
+            table: "thing",
+            column: "name",
+        }));
+        let mapping = registry.apply(&[class("App\\Thing", vec![])]);
+        assert_eq!(
+            mapping.tables.get("App\\Thing").map(String::as_str),
+            Some("thing")
+        );
+        let col = mapping
+            .columns
+            .get(&("App\\Thing".to_string(), "name".to_string()))
+            .expect("custom column");
+        assert_eq!(
+            (
+                col.table.as_str(),
+                col.column.as_str(),
+                col.handler.as_str()
+            ),
+            ("thing", "name", "custom-columns")
+        );
     }
 }
