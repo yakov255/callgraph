@@ -6,6 +6,23 @@ use std::path::PathBuf;
 
 use callgraph::flow::{Index, scan_flow, scan_parents};
 
+fn fixture_dir(name: &str, files: &[(&str, &str)]) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "callgraph-flow-{name}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    for (path, source) in files {
+        let target = dir.join(path);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(target, source).unwrap();
+    }
+    dir
+}
+
 fn fixture() -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "callgraph-flow-{}-{}",
@@ -119,5 +136,78 @@ fn column_reaches_the_use_case_read_through_the_entity() {
             .any(|atom| atom.contains("getServiceType")),
         "{:?}",
         read.chain
+    );
+}
+
+#[test]
+fn literal_call_does_not_inherit_another_sites_column() {
+    let dir = fixture_dir(
+        "precise",
+        &[
+            (
+                "src/H.php",
+                r#"<?php
+namespace App;
+
+function isEn($value): bool
+{
+    return $value === 'en';
+}
+
+class Client
+{
+    public string $nameEn;
+
+    public function check(Client $other): void
+    {
+        $literal = isEn('en');
+        if ($literal) {
+            $x = 1;
+        }
+        $real = isEn($other->nameEn);
+        if ($real) {
+            $y = 2;
+        }
+    }
+}
+"#,
+            ),
+            (
+                "src/Repo.php",
+                r#"<?php
+namespace App;
+
+class Repo
+{
+    public function load(): Client
+    {
+        $row = $this->connection->fetchAssociative('SELECT * FROM clients');
+        $client = new Client();
+        $client->nameEn = $row['name_en'];
+        return $client;
+    }
+}
+"#,
+            ),
+        ],
+    );
+    let files = scan_flow(&dir).unwrap();
+    let index = Index::build(&files);
+    let traces = index.traces("name_en");
+    let _ = fs::remove_dir_all(&dir);
+
+    let lines: Vec<(String, u32)> = traces
+        .iter()
+        .map(|trace| (trace.method.clone(), trace.line))
+        .collect();
+    assert!(
+        lines
+            .iter()
+            .any(|(method, _)| method.ends_with("Client::check")),
+        "{lines:?}"
+    );
+    assert!(
+        !traces.iter().any(|trace| trace.expr.contains("isEn('en')")),
+        "literal call inherited another call site: {traces:#?}"
     );
 }
