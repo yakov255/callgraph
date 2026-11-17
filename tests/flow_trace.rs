@@ -581,3 +581,180 @@ class Runner
     assert!(must("Runner::runAlways"), "{traces:#?}");
     assert!(!must("Runner::runMaybe"), "{traces:#?}");
 }
+
+#[test]
+fn interface_dispatch_reaches_the_consumer() {
+    let dir = fixture_dir(
+        "iface",
+        &[(
+            "src/Ifaces.php",
+            r#"<?php
+namespace App;
+
+interface Src { public function name(): string; }
+
+class DbSrc implements Src
+{
+    public function __construct(private array $row) {}
+    public function name(): string { return $this->row['name_en']; }
+}
+
+class FixedSrc implements Src
+{
+    public function name(): string { return 'fixed'; }
+}
+
+class User
+{
+    public function show(Src $src): void
+    {
+        if ($src->name() === 'x') { $a = 1; }
+    }
+}
+"#,
+        )],
+    );
+    let files = scan_flow(&dir).unwrap();
+    let index = Index::build_with_parents(&files, &scan_parents(&dir).unwrap());
+    let traces = index.traces("name_en");
+    let _ = fs::remove_dir_all(&dir);
+    assert!(
+        traces
+            .iter()
+            .any(|trace| trace.method.ends_with("User::show")),
+        "{traces:#?}"
+    );
+}
+
+#[test]
+fn trait_method_reaches_the_consumer() {
+    let dir = fixture_dir(
+        "trait",
+        &[(
+            "src/TraitCase.php",
+            r#"<?php
+namespace App;
+
+trait HasName
+{
+    public function getName(): string { return $this->name; }
+}
+
+class Item
+{
+    use HasName;
+    private string $name;
+    public function __construct(string $name) { $this->name = $name; }
+}
+
+class User
+{
+    public function run(array $row): void
+    {
+        $item = new Item($row['name_en']);
+        if ($item->getName() === 'x') { $b = 2; }
+    }
+}
+"#,
+        )],
+    );
+    let files = scan_flow(&dir).unwrap();
+    let index = Index::build_with_parents(&files, &scan_parents(&dir).unwrap());
+    let traces = index.traces("name_en");
+    let _ = fs::remove_dir_all(&dir);
+    assert!(
+        traces
+            .iter()
+            .any(|trace| trace.method.ends_with("User::run")),
+        "{traces:#?}"
+    );
+}
+
+#[test]
+fn try_destructuring_and_yield_keep_the_column() {
+    let dir = fixture_dir(
+        "legacy",
+        &[(
+            "src/Legacy.php",
+            r#"<?php
+namespace App;
+
+class Legacy
+{
+    public function tryCase(array $row): void
+    {
+        try { $x = $row['name_en']; } catch (\Throwable $e) { $x = 'x'; }
+        if ($x) { $a = 1; }
+    }
+
+    public function destructure(array $row): void
+    {
+        list($name) = [$row['name_en']];
+        if ($name) { $b = 2; }
+    }
+
+    public function gen(array $row): \Generator
+    {
+        yield $row['name_en'];
+    }
+
+    public function consume(array $row): void
+    {
+        foreach ($this->gen($row) as $value) {
+            if ($value) { $c = 3; }
+        }
+    }
+}
+"#,
+        )],
+    );
+    let files = scan_flow(&dir).unwrap();
+    let index = Index::build(&files);
+    let traces = index.traces("name_en");
+    let _ = fs::remove_dir_all(&dir);
+    let methods: Vec<&str> = traces.iter().map(|trace| trace.method.as_str()).collect();
+    assert!(
+        methods.iter().any(|m| m.ends_with("Legacy::tryCase")),
+        "{methods:?}"
+    );
+    assert!(
+        methods.iter().any(|m| m.ends_with("Legacy::destructure")),
+        "{methods:?}"
+    );
+    assert!(
+        methods.iter().any(|m| m.ends_with("Legacy::consume")),
+        "{methods:?}"
+    );
+}
+
+#[test]
+fn array_column_keeps_the_column_key() {
+    let dir = fixture_dir(
+        "column",
+        &[(
+            "src/ColumnCase.php",
+            r#"<?php
+namespace App;
+
+class ColumnCase
+{
+    public function run(array $rows): void
+    {
+        $names = array_column($rows, 'name_en');
+        if ($names) { $a = 1; }
+    }
+}
+"#,
+        )],
+    );
+    let files = scan_flow(&dir).unwrap();
+    let index = Index::build(&files);
+    let traces = index.traces("name_en");
+    let _ = fs::remove_dir_all(&dir);
+    assert!(
+        traces
+            .iter()
+            .any(|trace| trace.method.ends_with("ColumnCase::run")),
+        "{traces:#?}"
+    );
+}
