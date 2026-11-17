@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use mago_span::HasSpan;
 use mago_syntax::cst::*;
 
-use super::model::{ArgEdge, Assign, FlowFile, MethodFlow, MethodTypes, Read};
+use super::model::{ArgEdge, Assign, FlowFile, MethodFlow, MethodTypes, Read, ReceiverEdge};
 use crate::lang::php::analysis::NameResolver;
 use crate::lang::php::analysis::docblock::doc_comment_before;
 use crate::lang::php::parser::{MagoAdapter, ParsedFile, PhpParser};
@@ -513,14 +513,14 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
                 };
                 let name = lossy(property.value);
                 if is_this(access.object) {
-                    if let Some(class) = self.class.clone() {
+                    if self.class.is_some() {
                         self.set_var(&format!("this->{name}"), &origins);
                         if let Some(ty) = ty {
                             self.types.insert(format!("this->{name}"), ty);
                         }
                         self.flow.assigns.push(Assign {
                             line,
-                            lhs: format!("prop:{class}::{name}"),
+                            lhs: format!("prop:this::{name}"),
                             origins: origins.clone(),
                         });
                     }
@@ -544,6 +544,17 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
                         origins: origins.clone(),
                     });
                 }
+            }
+            Expression::ArrayAppend(append) => {
+                let Some(base) = direct_var_name(append.array) else {
+                    return origins;
+                };
+                self.set_var(&base, &origins);
+                self.flow.assigns.push(Assign {
+                    line,
+                    lhs: format!("{base}[]"),
+                    origins: origins.clone(),
+                });
             }
             _ => {}
         }
@@ -650,20 +661,31 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
 
     /// Вызов: рёбра аргументов, исток `c:<target>@<line>` и (для значения) чтение.
     fn call(&mut self, call: &Call<'a>, used: bool) -> Vec<String> {
-        match call {
-            Call::Method(node) => {
-                self.origins(node.object);
-            }
-            Call::NullSafeMethod(node) => {
-                self.origins(node.object);
-            }
+        let object = match call {
+            Call::Method(node) => Some(node.object),
+            Call::NullSafeMethod(node) => Some(node.object),
             Call::StaticMethod(node) => {
                 self.origins(node.class);
+                None
             }
-            Call::Function(_) => {}
-        }
+            Call::Function(_) => None,
+        };
         let target = self.call_target(call);
         let line = self.line_of(call);
+        if let Some(object) = object
+            && let Some(target) = &target
+        {
+            let origins = if is_this(object) {
+                vec!["this".to_string()]
+            } else {
+                self.origins(object)
+            };
+            self.flow.receivers.push(ReceiverEdge {
+                line,
+                target: target.clone(),
+                origins: norm(origins),
+            });
+        }
         self.arguments(call.get_argument_list(), target.as_deref(), line);
         match target {
             Some(target) => {
@@ -679,12 +701,13 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
 
     fn instantiation(&mut self, node: &Instantiation<'a>) -> Vec<String> {
         let class = self.class_name(node.class);
+        let line = self.line_of(node);
         if let Some(arguments) = &node.argument_list {
             let target = class.as_ref().map(|class| format!("{class}::__construct"));
-            self.arguments(arguments, target.as_deref(), self.line_of(node));
+            self.arguments(arguments, target.as_deref(), line);
         }
         match class {
-            Some(class) => vec![format!("new:{class}")],
+            Some(class) => vec![format!("new:{class}@{line}")],
             None => vec!["unknown".into()],
         }
     }
@@ -806,10 +829,7 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
         };
         let name = lossy(property.value);
         if is_this(object) {
-            return self
-                .class
-                .as_ref()
-                .map(|class| format!("prop:{class}::{name}"));
+            return Some(format!("prop:this::{name}"));
         }
         self.type_of(object)
             .map(|class| format!("prop:{class}::{name}"))
@@ -848,13 +868,11 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
             if let Some(ty) = &ty {
                 self.types.insert(name.clone(), ty.clone());
             }
-            if parameter.is_promoted_property()
-                && let Some(class) = self.class.clone()
-            {
+            if parameter.is_promoted_property() && self.class.is_some() {
                 let property = name.trim_start_matches('$');
                 self.flow.assigns.push(Assign {
                     line: self.line_of(parameter),
-                    lhs: format!("prop:{class}::{property}"),
+                    lhs: format!("prop:this::{property}"),
                     origins: vec![atom],
                 });
                 if let Some(ty) = ty {
@@ -1257,7 +1275,7 @@ class C
         let assign = ctor
             .assigns
             .iter()
-            .find(|assign| assign.lhs == "prop:C::p")
+            .find(|assign| assign.lhs == "prop:this::p")
             .expect("нет присваивания свойства");
         assert_eq!(assign.origins, vec!["p:C::__construct#0"]);
     }
@@ -1281,7 +1299,7 @@ class C
             getter
                 .returns
                 .iter()
-                .any(|ret| ret.origins.iter().any(|atom| atom == "prop:C::p")),
+                .any(|ret| ret.origins.iter().any(|atom| atom == "prop:this::p")),
             "{:?}",
             getter.returns
         );
@@ -1462,6 +1480,151 @@ class A
         assert_eq!(
             edges,
             vec![(11, 0, vec!["p:A::run#0"]), (12, 0, vec!["p:A::run#1"]),]
+        );
+    }
+
+    #[test]
+    fn this_property_assignment_uses_receiver_relative_atom() {
+        let source = r#"<?php
+class C
+{
+    private $p;
+
+    public function setP($x): void
+    {
+        $this->p = $x;
+    }
+
+    public function getP()
+    {
+        return $this->p;
+    }
+}
+"#;
+        let files = facts(source);
+        let setter = method(&files, "C::setP");
+        let assign = setter
+            .assigns
+            .iter()
+            .find(|assign| assign.lhs == "prop:this::p")
+            .expect("нет присваивания prop:this::p");
+        assert_eq!(assign.origins, vec!["p:C::setP#0"]);
+
+        let getter = method(&files, "C::getP");
+        assert!(
+            getter
+                .returns
+                .iter()
+                .any(|ret| ret.origins.iter().any(|atom| atom == "prop:this::p")),
+            "{:?}",
+            getter.returns
+        );
+    }
+
+    #[test]
+    fn this_call_receiver_is_this() {
+        let source = r#"<?php
+class C
+{
+    public function m(): void
+    {
+    }
+
+    public function run(): void
+    {
+        $this->m();
+    }
+}
+"#;
+        let files = facts(source);
+        let run = method(&files, "C::run");
+        let receiver = run
+            .receivers
+            .iter()
+            .find(|edge| edge.target == "C::m")
+            .expect("нет получателя вызова");
+        assert_eq!(receiver.origins, vec!["this"]);
+        assert_eq!(receiver.line, 10);
+    }
+
+    #[test]
+    fn instantiated_receiver_carries_allocation_site() {
+        let source = r#"<?php
+class C
+{
+    public function m(): void
+    {
+    }
+}
+
+class User
+{
+    public function run(): void
+    {
+        $obj = new C();
+        $obj->m();
+    }
+}
+"#;
+        let files = facts(source);
+        let run = method(&files, "User::run");
+        let receiver = run
+            .receivers
+            .iter()
+            .find(|edge| edge.target == "C::m")
+            .expect("нет получателя вызова");
+        assert!(
+            receiver
+                .origins
+                .iter()
+                .any(|atom| atom.starts_with("new:C@")),
+            "{:?}",
+            receiver.origins
+        );
+    }
+
+    #[test]
+    fn array_append_propagates_origin_into_return() {
+        let source = r#"<?php
+class Entity
+{
+}
+
+class Repo
+{
+    public function makeEntity($row): Entity
+    {
+        return new Entity();
+    }
+
+    public function all(array $rows): array
+    {
+        $result = [];
+        foreach ($rows as $row) {
+            $result[] = $this->makeEntity($row);
+        }
+        return $result;
+    }
+}
+"#;
+        let files = facts(source);
+        let all = method(&files, "Repo::all");
+        assert!(
+            all.assigns.iter().any(|assign| assign.lhs == "$result[]"
+                && assign
+                    .origins
+                    .iter()
+                    .any(|atom| atom.starts_with("c:Repo::makeEntity@"))),
+            "{:?}",
+            all.assigns
+        );
+        assert!(
+            all.returns.iter().any(|ret| ret
+                .origins
+                .iter()
+                .any(|atom| atom.starts_with("c:Repo::makeEntity@"))),
+            "{:?}",
+            all.returns
         );
     }
 

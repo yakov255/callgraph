@@ -7,6 +7,10 @@
 //! Результат вызова несёт call-site: `c:<method>@<line>` (1-based строка вызова). Индекс квалифицирует его
 //! в `c:<method>@<file>#<line>` и раскрывает `p:<method>#<i>` аргументами именно этого вызова; голый
 //! `c:<method>` (без `@`) остаётся для обратной совместимости и раскрывается глобально.
+//!
+//! Создание объекта — `new:<class>@<line>` (индекс: `new:<class>@<file>#<line>`), чтобы свойство можно было
+//! привязать к месту создания. `$this->p` — `prop:this::<p>` (индекс: `prop:this:<class>::<p>`); получатель
+//! вызова записывается в `MethodFlow.receivers` и раскрывает такое свойство для конкретного объекта.
 
 /// Типы возврата методов: `Class::method` → класс. Для `array` — тип элемента из `@return Foo[]`.
 pub type MethodTypes = std::collections::HashMap<String, String>;
@@ -30,6 +34,7 @@ pub struct MethodFlow {
     pub reads: Vec<Read>,
     pub returns: Vec<Read>,
     pub args: Vec<ArgEdge>,
+    pub receivers: Vec<ReceiverEdge>,
 }
 
 /// Присваивание: `lhs` получает истоки `origins` (ребро, в выдачу не идёт).
@@ -46,6 +51,14 @@ pub struct Assign {
 pub struct Read {
     pub line: u32,
     pub expr: String,
+    pub origins: Vec<String>,
+}
+
+/// Получатель вызова метода: истоки объекта (для привязки `prop:this::` к месту создания).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReceiverEdge {
+    pub line: u32,
+    pub target: String,
     pub origins: Vec<String>,
 }
 

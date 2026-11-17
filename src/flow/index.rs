@@ -7,6 +7,11 @@
 //! Результат вызова с call-site (`c:<method>@<line>`) при сборке квалифицируется в
 //! `c:<method>@<file>#<line>`; такой атом раскрывает `p:<method>#<i>` аргументами именно своего вызова.
 //! Голый `c:<method>` без `@` остаётся и раскрывается глобально (обратная совместимость).
+//!
+//! Создание объекта (`new:<class>@<line>`) квалифицируется так же — `new:<class>@<file>#<line>`;
+//! `$this->p` (`prop:this::<p>`) получает класс контейнера метода (`prop:this:<class>::<p>`).
+//! Получатели вызовов (`MethodFlow.receivers`) хранятся по `(цель, сайт)` и привязывают чтение
+//! свойства через геттер к месту создания объекта, а не ко всем объектам класса.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 
@@ -20,6 +25,10 @@ const ITERATION_LIMIT: usize = 32;
 const CHAIN_DEPTH: usize = 12;
 /// Предел числа цепочек на один терм.
 const TRACE_LIMIT: usize = 500;
+/// Предел глубины подстановки аргументов конструктора при привязке к месту создания.
+const ALLOCATION_DEPTH: usize = 6;
+/// Предел глубины раскрытия получателя через параметры.
+const RECEIVER_DEPTH: usize = 4;
 
 /// Чтение с контекстом файла и метода.
 #[derive(Debug, Clone)]
@@ -42,6 +51,8 @@ pub struct Index {
     site_args: HashMap<(String, String, usize), BTreeSet<String>>,
     /// Истоки присваиваний по `lhs` (для property — `prop:<class>::<p>`).
     assigns: HashMap<String, BTreeSet<String>>,
+    /// Истоки получателей вызовов по (цель вызова, сайт `file#line`).
+    receivers: HashMap<(String, String), BTreeSet<String>>,
     /// Все чтения проекта.
     reads: Vec<ReadFact>,
     /// Прямые родители: класс → полные имена родителей.
@@ -65,17 +76,23 @@ impl Index {
         };
         for file in files {
             for method in &file.methods {
+                let container = method.container.as_deref();
                 let returns = index.returns.entry(method.id.clone()).or_default();
                 for ret in &method.returns {
-                    returns.extend(ret.origins.iter().map(|origin| qualify(origin, &file.file)));
+                    returns.extend(
+                        ret.origins
+                            .iter()
+                            .map(|origin| qualify(origin, &file.file, container)),
+                    );
                 }
                 for assign in &method.assigns {
-                    if assign.lhs.starts_with("prop:") {
-                        index.assigns.entry(assign.lhs.clone()).or_default().extend(
+                    let lhs = qualify(&assign.lhs, &file.file, container);
+                    if lhs.starts_with("prop:") {
+                        index.assigns.entry(lhs).or_default().extend(
                             assign
                                 .origins
                                 .iter()
-                                .map(|origin| qualify(origin, &file.file)),
+                                .map(|origin| qualify(origin, &file.file, container)),
                         );
                     }
                 }
@@ -84,7 +101,7 @@ impl Index {
                     let origins: Vec<String> = arg
                         .origins
                         .iter()
-                        .map(|origin| qualify(origin, &file.file))
+                        .map(|origin| qualify(origin, &file.file, container))
                         .collect();
                     index
                         .args
@@ -97,6 +114,19 @@ impl Index {
                         .or_default()
                         .extend(origins);
                 }
+                for receiver in &method.receivers {
+                    let site = format!("{}#{}", file.file, receiver.line);
+                    let origins: Vec<String> = receiver
+                        .origins
+                        .iter()
+                        .map(|origin| qualify(origin, &file.file, container))
+                        .collect();
+                    index
+                        .receivers
+                        .entry((receiver.target.clone(), site))
+                        .or_default()
+                        .extend(origins);
+                }
                 for read in &method.reads {
                     index.reads.push(ReadFact {
                         file: file.file.clone(),
@@ -106,7 +136,7 @@ impl Index {
                         origins: read
                             .origins
                             .iter()
-                            .map(|origin| qualify(origin, &file.file))
+                            .map(|origin| qualify(origin, &file.file, container))
                             .collect(),
                     });
                 }
@@ -162,21 +192,18 @@ impl Index {
     }
 
     /// Непосредственные потомки атома по правилам раскрытия. Терминальные атомы дают пустое множество.
+    /// Для call-site `c:`-атома свойство `prop:this:<class>::<p>` раскрывается по получателю вызова.
     fn direct(&self, atom: &str) -> BTreeSet<String> {
-        if atom.starts_with("prop:") {
-            return self.assigns.get(atom).cloned().unwrap_or_default();
-        }
-        if let Some(rest) = atom.strip_prefix("c:") {
-            let (target, site) = split_call(rest);
-            let Some(origins) = self.returns_for_target(target) else {
-                return BTreeSet::new();
-            };
-            let Some(site) = site else {
-                // Голый `c:<method>`: текущее глобальное раскрытие.
-                return origins.clone();
-            };
+        if let Some(rest) = atom.strip_prefix("c:")
+            && let (target, Some(site)) = split_call(rest)
+            && let Some(origins) = self.returns_for_target(target)
+        {
             let mut set = BTreeSet::new();
             for origin in origins {
+                if is_this_property(origin) {
+                    set.extend(self.receiver_property(target, site, origin));
+                    continue;
+                }
                 if let Some((param_target, index)) = parse_param(origin) {
                     // Собственный параметр метода (в т.ч. унаследованного с тем же именем):
                     // аргументы именно этого вызова; их отсутствие — пустой набор, не глобальные.
@@ -193,6 +220,45 @@ impl Index {
             }
             return set;
         }
+        self.raw_direct(atom)
+    }
+
+    /// Раскрытие без привязки к получателю: `p:` — глобальные аргументы, `c:` — возвраты
+    /// (call-site — аргументы своего вызова), `prop:` — записи свойства.
+    fn raw_direct(&self, atom: &str) -> BTreeSet<String> {
+        // `prop:...@new:<class>@<file>#<line>`: свойство, привязанное к месту создания
+        if let Some((property, allocation)) = atom.split_once('@')
+            && property.starts_with("prop:")
+            && let Some((class, Some(site))) = parse_new(allocation)
+        {
+            return self.allocation_property(property, class, site);
+        }
+        if atom.starts_with("prop:") {
+            return self.assigns.get(atom).cloned().unwrap_or_default();
+        }
+        if let Some(rest) = atom.strip_prefix("c:") {
+            let (target, site) = split_call(rest);
+            let Some(origins) = self.returns_for_target(target) else {
+                return BTreeSet::new();
+            };
+            let Some(site) = site else {
+                // Голый `c:<method>`: текущее глобальное раскрытие.
+                return origins.clone();
+            };
+            let mut set = BTreeSet::new();
+            for origin in origins {
+                if let Some((param_target, index)) = parse_param(origin)
+                    && same_method(param_target, target)
+                {
+                    if let Some(args) = self.site_args_for(target, site, index) {
+                        set.extend(args.iter().cloned());
+                    }
+                    continue;
+                }
+                set.insert(origin.clone());
+            }
+            return set;
+        }
         if let Some(rest) = atom.strip_prefix("p:")
             && let Some((target, index)) = rest.rsplit_once('#')
             && let Ok(index) = index.parse::<usize>()
@@ -201,6 +267,119 @@ impl Index {
             return set.clone();
         }
         BTreeSet::new()
+    }
+
+    /// Истоки свойства для получателя вызова: раскрытие получателя до мест создания объекта.
+    /// Если ни одно место создания не найдено — глобальные записи свойства.
+    fn receiver_property(&self, target: &str, site: &str, property: &str) -> BTreeSet<String> {
+        let mut set = BTreeSet::new();
+        if let Some(receivers) = self.receivers.get(&(target.to_string(), site.to_string())) {
+            for receiver in receivers {
+                let allocations = self.receiver_allocations(receiver);
+                if allocations.is_empty() {
+                    // `p:` без аргументов, `this`, `unknown` и прочее — глобальные записи.
+                    set.insert(property.to_owned());
+                    continue;
+                }
+                // свойство с контекстом места создания: `prop:...@new:<class>@<file>#<line>`
+                for (class, allocation_site) in allocations {
+                    set.insert(format!("{property}@new:{class}@{allocation_site}"));
+                }
+            }
+        }
+        if set.is_empty() {
+            set.insert(property.to_owned());
+        }
+        set
+    }
+
+    /// Записи свойства без привязки к объекту.
+    fn property_writes(&self, property: &str) -> BTreeSet<String> {
+        self.assigns.get(property).cloned().unwrap_or_default()
+    }
+
+    /// Места создания объекта в истоках получателя: раскрытие до неподвижной точки
+    /// (`p:` → глобальные аргументы, `c:` → возвраты, `prop:` → записи) и отбор `new:`-атомов.
+    fn receiver_allocations(&self, receiver: &str) -> Vec<(String, String)> {
+        let mut atoms = BTreeSet::new();
+        let mut seen = BTreeSet::new();
+        self.expand_receiver(receiver, 0, &mut seen, &mut atoms);
+        let mut allocations = Vec::new();
+        for atom in atoms {
+            if let Some((class, Some(site))) = parse_new(&atom) {
+                allocations.push((class.to_string(), site.to_string()));
+            }
+        }
+        allocations
+    }
+
+    /// Раскрытие истока получателя до неподвижной точки с пределом глубины.
+    fn expand_receiver(
+        &self,
+        origin: &str,
+        depth: usize,
+        seen: &mut BTreeSet<String>,
+        atoms: &mut BTreeSet<String>,
+    ) {
+        if !seen.insert(origin.to_string()) {
+            return;
+        }
+        atoms.insert(origin.to_string());
+        if depth >= RECEIVER_DEPTH {
+            return;
+        }
+        for child in self.raw_direct(origin) {
+            self.expand_receiver(&child, depth + 1, seen, atoms);
+        }
+    }
+
+    /// Записи свойства, раскрытые аргументами конструктора этого места создания.
+    fn allocation_property(&self, property: &str, class: &str, site: &str) -> BTreeSet<String> {
+        let mut set = BTreeSet::new();
+        for write in self.property_writes(property) {
+            set.extend(self.expand_allocation(&write, class, site, 0));
+        }
+        set
+    }
+
+    /// Подстановка аргументов конструктора места создания в истоки записи свойства.
+    /// `p:<C0>::__construct#<k>` для класса создания заменяется аргументами этого вызова;
+    /// прочие `p:` сначала раскрываются глобальными аргументами (форвардинг `parent::__construct`).
+    fn expand_allocation(
+        &self,
+        origin: &str,
+        class: &str,
+        site: &str,
+        depth: usize,
+    ) -> BTreeSet<String> {
+        let mut set = BTreeSet::new();
+        if depth >= ALLOCATION_DEPTH {
+            set.insert(origin.to_string());
+            return set;
+        }
+        if let Some((target, index)) = parse_param(origin) {
+            let own_constructor = target
+                .rsplit_once("::")
+                .is_some_and(|(owner, method)| owner == class && method == "__construct");
+            if own_constructor {
+                if let Some(args) = self.site_args_for(target, site, index) {
+                    for arg in args {
+                        set.extend(self.expand_allocation(arg, class, site, depth + 1));
+                    }
+                }
+                return set;
+            }
+            if let Some(args) = self.args_for(target, index) {
+                for arg in args {
+                    set.extend(self.expand_allocation(arg, class, site, depth + 1));
+                }
+                return set;
+            }
+            set.insert(origin.to_string());
+            return set;
+        }
+        set.insert(origin.to_string());
+        set
     }
 
     /// Истоки возвратов по цели вызова: `Класс::метод` с наследованием, иначе точный id (функция).
@@ -279,6 +458,10 @@ impl Index {
         }
         for (lhs, origins) in &self.assigns {
             atoms.insert(lhs.clone());
+            atoms.extend(origins.iter().cloned());
+        }
+        for ((target, _site), origins) in &self.receivers {
+            atoms.insert(format!("c:{target}"));
             atoms.extend(origins.iter().cloned());
         }
         for read in &self.reads {
@@ -405,23 +588,40 @@ impl Index {
     }
 }
 
-/// Квалификация call-site атома: `c:<method>@<line>` → `c:<method>@<file>#<line>`.
+/// Квалификация атома: call-site `c:`/`new:` → `@<file>#<line>`, `prop:this::<p>` → `prop:this:<class>::<p>`.
 /// Атом без `@`, без номера строки или уже с `#` после `@` не меняется.
-fn qualify(origin: &str, file: &str) -> String {
-    let Some(rest) = origin.strip_prefix("c:") else {
-        return origin.to_string();
-    };
-    let Some((method, line)) = rest.split_once('@') else {
-        return origin.to_string();
-    };
-    if method.is_empty()
-        || line.is_empty()
-        || line.contains('#')
-        || !line.chars().all(|ch| ch.is_ascii_digit())
-    {
-        return origin.to_string();
+fn qualify(origin: &str, file: &str, container: Option<&str>) -> String {
+    if let Some(rest) = origin.strip_prefix("c:") {
+        return match rest.split_once('@') {
+            Some((method, line)) if valid_call_site(method, line) => {
+                format!("c:{method}@{file}#{line}")
+            }
+            _ => origin.to_string(),
+        };
     }
-    format!("c:{method}@{file}#{line}")
+    if let Some(rest) = origin.strip_prefix("new:") {
+        return match rest.split_once('@') {
+            Some((class, line)) if valid_call_site(class, line) => {
+                format!("new:{class}@{file}#{line}")
+            }
+            _ => origin.to_string(),
+        };
+    }
+    if let Some(rest) = origin.strip_prefix("prop:this::") {
+        return match container {
+            Some(class) if !rest.is_empty() => format!("prop:this:{class}::{rest}"),
+            _ => origin.to_string(),
+        };
+    }
+    origin.to_string()
+}
+
+/// Голова и номер строки call-site атома пригодны для квалификации.
+fn valid_call_site(head: &str, line: &str) -> bool {
+    !head.is_empty()
+        && !line.is_empty()
+        && !line.contains('#')
+        && line.chars().all(|ch| ch.is_ascii_digit())
 }
 
 /// Разбор тела `c:`-атома на цель и сайт `file#line` (только для квалифицированного атома).
@@ -445,9 +645,37 @@ fn call_base(atom: &str) -> &str {
     }
 }
 
+/// Атом без call-site суффикса: `c:<method>` и `new:<class>` (суффикс скрывается).
+fn atom_base(atom: &str) -> &str {
+    if (atom.starts_with("new:") || atom.starts_with("prop:"))
+        && let Some(at) = atom.find('@')
+        && atom[at + 1..].contains('#')
+    {
+        return &atom[..at];
+    }
+    call_base(atom)
+}
+
 /// Атом для выдачи: call-site суффикс скрывается, цепочка остаётся читаемой.
 fn display_atom(atom: &str) -> String {
-    call_base(atom).to_string()
+    atom_base(atom).to_string()
+}
+
+/// Свойство текущего объекта: `prop:this::<p>` или квалифицированный `prop:this:<class>::<p>`.
+fn is_this_property(atom: &str) -> bool {
+    atom.starts_with("prop:this:")
+}
+
+/// Разбор `new:<class>@<file>#<line>`; у неквалифицированного сайта — `None`.
+fn parse_new(atom: &str) -> Option<(&str, Option<&str>)> {
+    let rest = atom.strip_prefix("new:")?;
+    if rest.is_empty() {
+        return None;
+    }
+    match rest.split_once('@') {
+        Some((class, site)) if !class.is_empty() && site.contains('#') => Some((class, Some(site))),
+        _ => Some((rest, None)),
+    }
 }
 
 /// Разбор `p:<method>#<i>`.
@@ -506,7 +734,7 @@ fn match_atom(
 
 /// Последний сегмент атома после `::` или `.` (call-site суффикс не учитывается).
 fn last_segment(atom: &str) -> &str {
-    let atom = call_base(atom);
+    let atom = atom_base(atom);
     let after_scope = atom.rsplit("::").next().unwrap_or(atom);
     after_scope.rsplit('.').next().unwrap_or(after_scope)
 }
@@ -514,7 +742,7 @@ fn last_segment(atom: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::flow::model::{ArgEdge, Assign, MethodFlow, Read};
+    use crate::flow::model::{ArgEdge, Assign, MethodFlow, Read, ReceiverEdge};
 
     fn read(line: u32, expr: &str, origins: &[&str]) -> Read {
         Read {
@@ -551,6 +779,14 @@ mod tests {
             line,
             target: target.into(),
             index,
+            origins: origins.iter().map(|origin| (*origin).to_string()).collect(),
+        }
+    }
+
+    fn receiver(line: u32, target: &str, origins: &[&str]) -> ReceiverEdge {
+        ReceiverEdge {
+            line,
+            target: target.into(),
             origins: origins.iter().map(|origin| (*origin).to_string()).collect(),
         }
     }
@@ -718,5 +954,175 @@ mod tests {
             traces[0].chain.last().map(String::as_str),
             Some("c:H::isEn")
         );
+    }
+
+    /// Два создания одного класса с разными аргументами: геттер читает свойство своего объекта.
+    #[test]
+    fn allocation_site_binds_the_property() {
+        let mut ctor = method("Item::__construct");
+        ctor.container = Some("Item".into());
+        ctor.params = 1;
+        ctor.assigns
+            .push(assign(3, "prop:this::name", &["p:Item::__construct#0"]));
+        let mut getter = method("Item::getName");
+        getter.container = Some("Item".into());
+        getter
+            .returns
+            .push(read(7, "$this->name", &["prop:this::name"]));
+        let mut run = method("A::run");
+        run.args
+            .push(arg(20, "Item::__construct", 0, &["key:name_en"]));
+        run.args.push(arg(21, "Item::__construct", 0, &["lit"]));
+        run.receivers
+            .push(receiver(22, "Item::getName", &["new:Item@20"]));
+        run.receivers
+            .push(receiver(23, "Item::getName", &["new:Item@21"]));
+        run.reads
+            .push(read(22, "$a->getName()", &["c:Item::getName@22"]));
+        run.reads
+            .push(read(23, "$b->getName()", &["c:Item::getName@23"]));
+        let index = Index::build(&[file("a.php", vec![ctor, getter, run])]);
+
+        let traces = index.traces("name_en");
+        assert_eq!(traces.len(), 1, "{traces:#?}");
+        assert_eq!(traces[0].line, 22);
+    }
+
+    /// Форвардинг `parent::__construct` сохраняет место создания: свойство родителя видно.
+    #[test]
+    fn parent_constructor_forwarding_keeps_the_allocation() {
+        let mut parent_ctor = method("Parent::__construct");
+        parent_ctor.container = Some("Parent".into());
+        parent_ctor.params = 1;
+        parent_ctor
+            .assigns
+            .push(assign(3, "prop:this::name", &["p:Parent::__construct#0"]));
+        let mut parent_get = method("Parent::getName");
+        parent_get.container = Some("Parent".into());
+        parent_get
+            .returns
+            .push(read(6, "$this->name", &["prop:this::name"]));
+        let mut child_ctor = method("Child::__construct");
+        child_ctor.container = Some("Child".into());
+        child_ctor.params = 1;
+        child_ctor.args.push(arg(
+            10,
+            "Parent::__construct",
+            0,
+            &["p:Child::__construct#0"],
+        ));
+        let mut run = method("A::run");
+        run.args
+            .push(arg(20, "Child::__construct", 0, &["key:name_en"]));
+        run.args.push(arg(21, "Child::__construct", 0, &["lit"]));
+        run.receivers
+            .push(receiver(22, "Child::getName", &["new:Child@20"]));
+        run.receivers
+            .push(receiver(23, "Child::getName", &["new:Child@21"]));
+        run.reads
+            .push(read(22, "$a->getName()", &["c:Child::getName@22"]));
+        run.reads
+            .push(read(23, "$b->getName()", &["c:Child::getName@23"]));
+        let mut parents = HashMap::new();
+        parents.insert("Child".to_string(), vec!["Parent".to_string()]);
+        let index = Index::build_with_parents(
+            &[file(
+                "a.php",
+                vec![parent_ctor, parent_get, child_ctor, run],
+            )],
+            &parents,
+        );
+
+        let traces = index.traces("name_en");
+        assert_eq!(traces.len(), 1, "{traces:#?}");
+        assert_eq!(traces[0].line, 22);
+    }
+
+    /// Получатель через параметр: аргумент вызывающего — место создания объекта.
+    #[test]
+    fn receiver_through_a_parameter() {
+        let mut ctor = method("Item::__construct");
+        ctor.container = Some("Item".into());
+        ctor.params = 1;
+        ctor.assigns
+            .push(assign(3, "prop:this::name", &["p:Item::__construct#0"]));
+        let mut getter = method("Item::getName");
+        getter.container = Some("Item".into());
+        getter
+            .returns
+            .push(read(7, "$this->name", &["prop:this::name"]));
+        let mut use_method = method("A::use");
+        use_method.params = 1;
+        use_method
+            .receivers
+            .push(receiver(8, "Item::getName", &["p:A::use#0"]));
+        use_method
+            .reads
+            .push(read(8, "$item->getName()", &["c:Item::getName@8"]));
+        let mut caller = method("A::caller");
+        caller.params = 1;
+        caller.args.push(arg(20, "A::use", 0, &["new:Item@20"]));
+        caller
+            .args
+            .push(arg(20, "Item::__construct", 0, &["key:name_en"]));
+        let index = Index::build(&[file("a.php", vec![ctor, getter, use_method, caller])]);
+
+        let traces = index.traces("name_en");
+        assert_eq!(traces.len(), 1, "{traces:#?}");
+        assert_eq!(traces[0].method, "A::use");
+        assert_eq!(traces[0].line, 8);
+    }
+
+    /// Неизвестный получатель: глобальные записи свойства, без паники.
+    #[test]
+    fn unknown_receiver_falls_back_to_global() {
+        let mut init = method("Item::init");
+        init.container = Some("Item".into());
+        init.assigns
+            .push(assign(4, "prop:this::name", &["key:name_en"]));
+        let mut getter = method("Item::getName");
+        getter.container = Some("Item".into());
+        getter
+            .returns
+            .push(read(7, "$this->name", &["prop:this::name"]));
+        let mut run = method("A::run");
+        run.receivers
+            .push(receiver(9, "Item::getName", &["unknown"]));
+        run.reads
+            .push(read(9, "$item->getName()", &["c:Item::getName@9"]));
+        let index = Index::build(&[file("a.php", vec![init, getter, run])]);
+
+        let traces = index.traces("name_en");
+        assert_eq!(traces.len(), 1, "{traces:#?}");
+        assert_eq!(traces[0].line, 9);
+    }
+
+    /// Получатель раскрывается через цепочку вызовов до места создания объекта.
+    #[test]
+    fn receiver_expands_through_calls() {
+        let mut ctor = method("Item::__construct");
+        ctor.container = Some("Item".into());
+        ctor.params = 1;
+        ctor.assigns
+            .push(assign(3, "prop:this::name", &["p:Item::__construct#0"]));
+        let mut make = method("A::make");
+        make.args
+            .push(arg(3, "Item::__construct", 0, &["key:name_en"]));
+        make.returns.push(read(3, "new Item('x')", &["new:Item@3"]));
+        let mut repo = method("A::repo");
+        repo.returns
+            .push(read(2, "$this->make()", &["c:A::make@2"]));
+        let mut get = method("A::get");
+        get.returns
+            .push(read(4, "$this->name", &["prop:this:Item::name"]));
+        let mut user = method("A::use");
+        user.receivers.push(receiver(6, "A::get", &["c:A::repo@5"]));
+        user.reads.push(read(6, "$x->get()", &["c:A::get@6"]));
+        let index = Index::build(&[file("a.php", vec![ctor, make, repo, get, user])]);
+
+        let traces = index.traces("name_en");
+        assert_eq!(traces.len(), 1, "{traces:#?}");
+        assert_eq!(traces[0].line, 6);
+        assert!(has(&traces[0], "c:A::get") && has(&traces[0], "key:name_en"));
     }
 }
