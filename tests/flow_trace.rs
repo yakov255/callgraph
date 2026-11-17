@@ -1291,3 +1291,177 @@ class GlobalCase
         "the global variable did not carry the column across methods: {traces:#?}"
     );
 }
+
+#[test]
+fn isset_narrows_the_nullable_value() {
+    let dir = fixture_dir(
+        "isset-null",
+        &[(
+            "src/IssetCase.php",
+            r#"<?php
+class C {
+  function run(array $row): void {
+    $x = $row['name_en'] ?? null;
+    if ($x !== null) { if ($x) { $a = 1; } }
+  }
+}
+"#,
+        )],
+    );
+    let files = scan_flow(&dir).unwrap();
+    let index = Index::build(&files);
+    let traces = index.traces("name_en");
+    let _ = fs::remove_dir_all(&dir);
+
+    let read = traces
+        .iter()
+        .find(|trace| trace.method.ends_with("C::run") && trace.line == 5)
+        .unwrap_or_else(|| panic!("the null check did not read the column: {traces:#?}"));
+    assert!(
+        read.expr.contains("$x"),
+        "unexpected read expr: {}",
+        read.expr
+    );
+    assert!(
+        read.chain.iter().any(|atom| atom.contains("name_en")),
+        "{:?}",
+        read.chain
+    );
+}
+
+#[test]
+fn array_key_exists_narrows_the_offset() {
+    let dir = fixture_dir(
+        "key-exists",
+        &[(
+            "src/KeyExists.php",
+            r#"<?php
+function run(array $row) { if (array_key_exists('name_en', $row)) { $v = $row['name_en']; if ($v) {} } }
+"#,
+        )],
+    );
+    let files = scan_flow(&dir).unwrap();
+    let index = Index::build(&files);
+    let traces = index.traces("name_en");
+    let _ = fs::remove_dir_all(&dir);
+
+    assert!(
+        traces.iter().any(|trace| {
+            trace.method.ends_with("run") && trace.chain.iter().any(|atom| atom == "key:name_en")
+        }),
+        "the guarded offset lost key:name_en: {traces:#?}"
+    );
+}
+
+#[test]
+fn loop_needs_a_second_iteration() {
+    let dir = fixture_dir(
+        "loop-second",
+        &[(
+            "src/LoopCase.php",
+            r#"<?php
+function run(array $rows): void {
+    $x = 'a';
+    foreach ($rows as $row) { $x = $row['name_en']; }
+    if ($x) { $a = 1; }
+}
+"#,
+        )],
+    );
+    let files = scan_flow(&dir).unwrap();
+    let index = Index::build(&files);
+    let traces = index.traces("name_en");
+    let _ = fs::remove_dir_all(&dir);
+
+    assert!(
+        traces.iter().any(|trace| {
+            trace.method.ends_with("run")
+                && trace.line == 5
+                && trace.chain.iter().any(|atom| atom.contains("name_en"))
+        }),
+        "the read after the loop lost the column: {traces:#?}"
+    );
+}
+
+#[test]
+fn switch_break_stops_fallthrough() {
+    let dir = fixture_dir(
+        "switch-break",
+        &[(
+            "src/SwitchCase.php",
+            r#"<?php
+function run(string $k, array $row): void {
+    $x = 'z';
+    switch ($k) {
+        case 'a': $x = $row['name_en']; break;
+        case 'b': if ($x) { $a = 1; } break;
+    }
+}
+"#,
+        )],
+    );
+    let files = scan_flow(&dir).unwrap();
+    let index = Index::build(&files);
+    let traces = index.traces("name_en");
+    let _ = fs::remove_dir_all(&dir);
+
+    assert!(
+        traces
+            .iter()
+            .any(|trace| trace.method.ends_with("run") && trace.line == 5),
+        "the first case did not read the column: {traces:#?}"
+    );
+    assert!(
+        !traces.iter().any(|trace| {
+            trace.method.ends_with("run") && trace.line == 6 && trace.expr.contains("$x")
+        }),
+        "the read in case 'b' inherited the broken branch: {traces:#?}"
+    );
+}
+
+#[test]
+fn match_arms_union_and_must() {
+    let dir = fixture_dir(
+        "match-arms",
+        &[(
+            "src/MatchArms.php",
+            r#"<?php
+function run(string $k, array $row): string {
+    $x = match ($k) { 'a' => $row['name_en'], default => 'x' };
+    return $x;
+}
+function run2(string $k, array $row): string {
+    $x = match ($k) { 'a' => $row['name_en'], 'b' => $row['name_en'], default => $row['name_en'] };
+    return $x;
+}
+function consumeMay(string $k, array $row): void {
+    if (run($k, $row)) { $a = 1; }
+}
+function consumeMust(string $k, array $row): void {
+    if (run2($k, $row)) { $b = 1; }
+}
+"#,
+        )],
+    );
+    let files = scan_flow(&dir).unwrap();
+    let index = Index::build(&files);
+    let traces = index.traces("name_en");
+    let _ = fs::remove_dir_all(&dir);
+
+    // `return $x` не узел выдачи: `must` возврата виден на чтении результата вызова.
+    let maybe = traces
+        .iter()
+        .find(|trace| trace.method.ends_with("consumeMay") && trace.expr.contains("run("))
+        .unwrap_or_else(|| panic!("run() did not return the column: {traces:#?}"));
+    assert!(!maybe.must, "a partial match arm became must: {maybe:#?}");
+    assert!(
+        maybe.chain.iter().any(|atom| atom.contains("name_en")),
+        "{:?}",
+        maybe.chain
+    );
+    let always = traces
+        .iter()
+        .find(|trace| trace.method.ends_with("consumeMust") && trace.expr.contains("run2("))
+        .unwrap_or_else(|| panic!("run2() did not return the column: {traces:#?}"));
+    assert!(always.must, "a full match union lost must: {always:#?}");
+}
