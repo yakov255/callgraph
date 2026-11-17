@@ -758,3 +758,536 @@ class ColumnCase
         "{traces:#?}"
     );
 }
+
+#[test]
+fn fetch_object_property_is_a_column() {
+    let dir = fixture_dir(
+        "fetch-object",
+        &[(
+            "src/FetchObject.php",
+            r#"<?php
+namespace App;
+
+class UseCase
+{
+    public function run(object $stmt): void
+    {
+        $row = $stmt->fetchObject();
+        if ($row->name_en) {
+            $a = 1;
+        }
+    }
+}
+"#,
+        )],
+    );
+    let files = scan_flow(&dir).unwrap();
+    let index = Index::build_with_parents(&files, &scan_parents(&dir).unwrap());
+    let traces = index.traces("name_en");
+    let _ = fs::remove_dir_all(&dir);
+
+    assert!(
+        traces
+            .iter()
+            .any(|trace| trace.method.ends_with("UseCase::run") && trace.expr.contains("name_en")),
+        "fetchObject() property read was not bound to the column: {traces:#?}"
+    );
+}
+
+#[test]
+fn magic_get_property_is_a_column() {
+    let dir = fixture_dir(
+        "magic-get",
+        &[(
+            "src/Magic.php",
+            r#"<?php
+namespace App;
+
+class Row
+{
+    private array $data = [];
+
+    public function __get(string $name): mixed
+    {
+        return $this->data[$name] ?? null;
+    }
+
+    public function __isset(string $name): bool
+    {
+        return isset($this->data[$name]);
+    }
+}
+
+class UseCase
+{
+    public function run(Row $obj): void
+    {
+        if ($obj->name_en) {
+            $a = 1;
+        }
+    }
+}
+"#,
+        )],
+    );
+    let files = scan_flow(&dir).unwrap();
+    let index = Index::build_with_parents(&files, &scan_parents(&dir).unwrap());
+    let traces = index.traces("name_en");
+    let _ = fs::remove_dir_all(&dir);
+
+    assert!(
+        traces
+            .iter()
+            .any(|trace| trace.method.ends_with("UseCase::run") && trace.expr.contains("name_en")),
+        "the __get property read was not bound to the column: {traces:#?}"
+    );
+}
+
+#[test]
+fn extract_variables_are_columns() {
+    let dir = fixture_dir(
+        "extract",
+        &[(
+            "src/Extract.php",
+            r#"<?php
+namespace App;
+
+class UseCase
+{
+    public function run(array $row): void
+    {
+        extract($row);
+        if ($name_en) {
+            $a = 1;
+        }
+    }
+}
+"#,
+        )],
+    );
+    let files = scan_flow(&dir).unwrap();
+    let index = Index::build(&files);
+    let traces = index.traces("name_en");
+    let _ = fs::remove_dir_all(&dir);
+
+    assert!(
+        traces.iter().any(|trace| {
+            trace.method.ends_with("UseCase::run") && trace.expr.contains("name_en")
+        }),
+        "extract() variables were not bound to the columns: {traces:#?}"
+    );
+}
+
+#[test]
+fn get_object_vars_exposes_properties() {
+    let dir = fixture_dir(
+        "object-vars",
+        &[(
+            "src/Vars.php",
+            r#"<?php
+namespace App;
+
+class Item
+{
+    public string $name_en = '';
+
+    public function toArray(): array
+    {
+        return get_object_vars($this);
+    }
+}
+"#,
+        )],
+    );
+    let files = scan_flow(&dir).unwrap();
+    let index = Index::build_with_parents(&files, &scan_parents(&dir).unwrap());
+    let traces = index.traces("name_en");
+    let _ = fs::remove_dir_all(&dir);
+
+    let exposes = traces.iter().any(|trace| {
+        trace.method.ends_with("Item::toArray")
+            && trace.chain.iter().any(|atom| {
+                atom == "key:name_en" || atom == "prop:name_en" || atom.ends_with("::name_en")
+            })
+    });
+    assert!(
+        exposes,
+        "get_object_vars($this) did not expose the property as a column: {traces:#?}"
+    );
+}
+
+#[test]
+fn compact_keeps_variable_origins() {
+    let dir = fixture_dir(
+        "compact",
+        &[(
+            "src/Compact.php",
+            r#"<?php
+namespace App;
+
+class UseCase
+{
+    public function run(array $row): void
+    {
+        $name_en = $row['name_en'];
+        $data = compact('name_en');
+        if ($data) {
+            $a = 1;
+        }
+    }
+}
+"#,
+        )],
+    );
+    let files = scan_flow(&dir).unwrap();
+    let index = Index::build(&files);
+    let traces = index.traces("name_en");
+    let _ = fs::remove_dir_all(&dir);
+
+    assert!(
+        traces
+            .iter()
+            .any(|trace| trace.method.ends_with("UseCase::run") && trace.expr == "$data"),
+        "compact() lost the variable origins: {traces:#?}"
+    );
+}
+
+#[test]
+fn match_value_keeps_the_branch() {
+    let dir = fixture_dir(
+        "match",
+        &[(
+            "src/Match.php",
+            r#"<?php
+namespace App;
+
+class UseCase
+{
+    public function run(array $row, string $k): void
+    {
+        $name = match ($k) {
+            'a' => $row['name_en'],
+            default => 'x',
+        };
+        if ($name) {
+            $a = 1;
+        }
+    }
+}
+"#,
+        )],
+    );
+    let files = scan_flow(&dir).unwrap();
+    let index = Index::build(&files);
+    let traces = index.traces("name_en");
+    let _ = fs::remove_dir_all(&dir);
+
+    assert!(
+        traces
+            .iter()
+            .any(|trace| trace.method.ends_with("UseCase::run") && trace.expr == "$name"),
+        "match arm lost the column before the read: {traces:#?}"
+    );
+}
+
+#[test]
+fn array_map_arrow_keeps_the_column() {
+    let dir = fixture_dir(
+        "array-map",
+        &[(
+            "src/MapCase.php",
+            r#"<?php
+namespace App;
+
+class MapCase
+{
+    public function run(array $rows): void
+    {
+        $names = array_map(fn($r) => $r['name_en'], $rows);
+        if ($names) {
+            $a = 1;
+        }
+    }
+}
+"#,
+        )],
+    );
+    let files = scan_flow(&dir).unwrap();
+    let index = Index::build(&files);
+    let traces = index.traces("name_en");
+    let _ = fs::remove_dir_all(&dir);
+
+    assert!(
+        traces
+            .iter()
+            .any(|trace| trace.method.ends_with("MapCase::run") && trace.expr == "$names"),
+        "array_map() arrow lost the column before the read: {traces:#?}"
+    );
+}
+
+#[test]
+fn array_values_and_filter_keep_the_column() {
+    let dir = fixture_dir(
+        "array-values",
+        &[(
+            "src/ValuesCase.php",
+            r#"<?php
+namespace App;
+
+class ValuesCase
+{
+    public function run(array $rows): void
+    {
+        $names = array_values(array_filter($rows));
+        foreach ($names as $row) {
+            if ($row['name_en']) {
+                $a = 1;
+            }
+        }
+    }
+}
+"#,
+        )],
+    );
+    let files = scan_flow(&dir).unwrap();
+    let index = Index::build(&files);
+    let traces = index.traces("name_en");
+    let _ = fs::remove_dir_all(&dir);
+
+    assert!(
+        traces.iter().any(
+            |trace| trace.method.ends_with("ValuesCase::run") && trace.expr.contains("name_en")
+        ),
+        "array_values()/array_filter() lost the column: {traces:#?}"
+    );
+}
+
+#[test]
+fn named_argument_reaches_the_constructor() {
+    let dir = fixture_dir(
+        "named-arg",
+        &[
+            (
+                "src/Item.php",
+                r#"<?php
+namespace App;
+
+class Item
+{
+    public function __construct(private string $name)
+    {
+    }
+
+    public function getName(): string
+    {
+        return $this->name;
+    }
+}
+"#,
+            ),
+            (
+                "src/NamedUseCase.php",
+                r#"<?php
+namespace App;
+
+class NamedUseCase
+{
+    public function run(array $row): void
+    {
+        $item = new Item(name: $row['name_en']);
+        if ($item->getName()) {
+            $a = 1;
+        }
+    }
+}
+"#,
+            ),
+        ],
+    );
+    let files = scan_flow(&dir).unwrap();
+    let index = Index::build(&files);
+    let traces = index.traces("name_en");
+    let _ = fs::remove_dir_all(&dir);
+
+    assert!(
+        traces.iter().any(|trace| {
+            trace.method.ends_with("NamedUseCase::run") && trace.expr.contains("getName")
+        }),
+        "the named argument did not reach the constructor: {traces:#?}"
+    );
+}
+
+#[test]
+fn spread_argument_reaches_the_constructor() {
+    let dir = fixture_dir(
+        "spread-arg",
+        &[
+            (
+                "src/Item.php",
+                r#"<?php
+namespace App;
+
+class Item
+{
+    public function __construct(private string $name)
+    {
+    }
+
+    public function getName(): string
+    {
+        return $this->name;
+    }
+}
+"#,
+            ),
+            (
+                "src/SpreadUseCase.php",
+                r#"<?php
+namespace App;
+
+class SpreadUseCase
+{
+    public function run(array $row): void
+    {
+        $args = [$row['name_en']];
+        $item = new Item(...$args);
+        if ($item->getName()) {
+            $a = 1;
+        }
+    }
+}
+"#,
+            ),
+        ],
+    );
+    let files = scan_flow(&dir).unwrap();
+    let index = Index::build(&files);
+    let traces = index.traces("name_en");
+    let _ = fs::remove_dir_all(&dir);
+
+    assert!(
+        traces.iter().any(|trace| {
+            trace.method.ends_with("SpreadUseCase::run") && trace.expr.contains("getName")
+        }),
+        "the spread argument did not reach the constructor: {traces:#?}"
+    );
+}
+
+#[test]
+fn static_property_carries_the_column() {
+    let dir = fixture_dir(
+        "static-prop",
+        &[(
+            "src/StaticCache.php",
+            r#"<?php
+namespace App;
+
+class StaticCache
+{
+    private static string $name = '';
+
+    public function store(array $row): void
+    {
+        self::$name = $row['name_en'];
+    }
+
+    public function check(): void
+    {
+        if (self::$name) {
+            $a = 1;
+        }
+    }
+}
+"#,
+        )],
+    );
+    let files = scan_flow(&dir).unwrap();
+    let index = Index::build(&files);
+    let traces = index.traces("name_en");
+    let _ = fs::remove_dir_all(&dir);
+
+    assert!(
+        traces
+            .iter()
+            .any(|trace| trace.method.ends_with("StaticCache::check")),
+        "the static property did not carry the column across methods: {traces:#?}"
+    );
+}
+
+#[test]
+fn foreach_key_comparison_is_a_column() {
+    let dir = fixture_dir(
+        "foreach-key",
+        &[(
+            "src/KeyCase.php",
+            r#"<?php
+namespace App;
+
+class KeyCase
+{
+    public function run(array $row): void
+    {
+        foreach ($row as $key => $value) {
+            if ($key === 'name_en') {
+                $a = 1;
+            }
+        }
+    }
+}
+"#,
+        )],
+    );
+    let files = scan_flow(&dir).unwrap();
+    let index = Index::build(&files);
+    let traces = index.traces("name_en");
+    let _ = fs::remove_dir_all(&dir);
+
+    assert!(
+        traces.iter().any(|trace| {
+            trace.method.ends_with("KeyCase::run")
+                && trace.chain.iter().any(|atom| atom == "key:name_en")
+        }),
+        "the foreach key comparison did not carry key:name_en: {traces:#?}"
+    );
+}
+
+#[test]
+fn global_variable_carries_the_column() {
+    let dir = fixture_dir(
+        "global-var",
+        &[(
+            "src/GlobalCase.php",
+            r#"<?php
+namespace App;
+
+class GlobalCase
+{
+    public function store(array $row): void
+    {
+        global $name;
+        $name = $row['name_en'];
+    }
+
+    public function check(): void
+    {
+        global $name;
+        if ($name) {
+            $a = 1;
+        }
+    }
+}
+"#,
+        )],
+    );
+    let files = scan_flow(&dir).unwrap();
+    let index = Index::build(&files);
+    let traces = index.traces("name_en");
+    let _ = fs::remove_dir_all(&dir);
+
+    assert!(
+        traces
+            .iter()
+            .any(|trace| trace.method.ends_with("GlobalCase::check")),
+        "the global variable did not carry the column across methods: {traces:#?}"
+    );
+}
