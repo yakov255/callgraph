@@ -51,6 +51,30 @@ A projekt gyökerében (JSONC: `//` és `/* */` megjegyzés is lehet). A fájl n
 A `fieldsMap` sorrendjét a deklarált property-k döntik el: ha a kulcs property-név, akkor `property => column`; ha az
 érték az, akkor `column => property`; egyébként `property => column` (ez a `Billet` konvenciója).
 
+## `flow trace`: hol olvassák az értéket
+
+A `flow map` csak a DB ↔ property éleket adja. A `flow trace` ugyanazon a tényeken (és a pluginokon) végigmegy a
+kódon: metóduson belül követi a változókat, property-ket és tömbkulcsokat, metódusok között a `return` / paraméter /
+property éleken, és kiírja, hol olvassák az értéket (nem a hozzárendelést: az csak továbbadás).
+
+```bash
+callgraph trace service_type --project raketa
+callgraph trace service_type record_type --project raketa --json
+```
+
+```
+root: /projects/raketa/raketa/api/queue
+trace: service_type · 3 reads in 3 files
+v1/src/Operation/GetQueueOperation.php  Api\Queue\V1\Operation\GetQueueOperation::mappingResponse  L64
+  $queue->getServiceType()
+  key:service_type → p:Api\Queue\Entity\Queue::__construct#2 → p:Api\Queue\Entity\QueueNoId::__construct#1 → prop:Api\Queue\Entity\QueueNoId::serviceType → c:Api\Queue\Entity\Queue::getServiceType
+```
+
+Korlátok: nincs SQL-parse (a kulcs a PHP-ból jön), dinamikus hívás / `__get` / `extract` esetén a lánc megszakad
+(`unknown`), a fixpont flow-érzéketlen (egy változó egy metódusban egy irokészlet), és a `c:` visszatérési érték
+minden hívási hely paramétereit egyesíti — ugyanaz a függvény literál argumentummal is örökölheti egy másik hívás
+oszlopát (híváspont-pontos visszatérés: következő lépés).
+
 ## Külső plugin (bármilyen nyelven)
 
 A parancs **egyszer** fut le projektenként: a stdin-en megkapja az összes osztály JSON-ját, a stdout-ra a
