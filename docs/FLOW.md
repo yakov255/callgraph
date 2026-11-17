@@ -78,6 +78,16 @@ híváspont-pontos: a `p:` paramétert az adott hívás argumentumai helyettesí
 helyének fogadójához (call-site kontextus); ismeretlen fogadó esetén globális fallback. Kivétel: egy `$this`-láncon
 belüli `$this->setX()` továbbra is globális.
 
+### may / must
+
+A `[must]` jelölés azt jelenti: a kolónia **minden olyan úton** eljut a reading, amely eljut magához a readinghez.
+`--must` csak ezeket listázza; alapból may („legalább egy úton”).
+
+Az elemzés path-sensitive az `if` / `elseif` / `else`, a ternáris operátor és a korai `return` esetén; egyszerű
+predikátumokat is kihasznál (`$flag = true|false`, `$x === null`, `isset`), az ellentmondó ágakat kihagyja. A ciklusok
+és a `switch` konzervatívak (may union, must metszet, gyakran üres); a property-írások `must`-ja még nincs követve,
+ezért a getteren át olvasott érték lehet may annak ellenére, hogy a konstruktor mindig beállítja.
+
 ## Külső plugin (bármilyen nyelven)
 
 A parancs **egyszer** fut le projektenként: a stdin-en megkapja az összes osztály JSON-ját, a stdout-ra a
