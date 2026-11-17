@@ -244,7 +244,7 @@ registering; without it, the current directory is the root.
 | String literal / constant usages | `callgraph.sh <dir> --strings <pattern>` · `--const <pattern>` |
 | Filter by call category | `callgraph.sh <dir> --category model_use,orm_relation` |
 | DB table ↔ property map | `callgraph.sh flow map [--project <alias>] [--table <name>]` |
-| DB column → read sites | `callgraph.sh trace <column\|table.column> [--must] [--project <alias>]` |
+| DB column → read sites (may by default; `--must` narrows) | `callgraph.sh trace <column\|table.column> [--must] [--project <alias>]` |
 
 ### Where to start: `locate`
 

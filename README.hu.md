@@ -246,7 +246,7 @@ relatív) regisztráció nélkül is működik; nélküle az aktuális mappa a g
 | String-literál / konstans helye | `callgraph.sh <mappa> --strings <minta>` · `--const <minta>` |
 | Szűrés hívás-kategóriára | `callgraph.sh <mappa> --category model_use,orm_relation` |
 | DB-tábla ↔ property megfeleltetés | `callgraph.sh flow map [--project <alias>] [--table <név>]` |
-| DB-oszlop → olvasási helyek | `callgraph.sh trace <oszlop\|tábla.oszlop> [--must] [--project <alias>]` |
+| DB-oszlop → olvasási helyek (alapból may; `--must` szűkít) | `callgraph.sh trace <oszlop\|tábla.oszlop> [--must] [--project <alias>]` |
 
 ### Honnan induljak: `locate`
 

@@ -70,8 +70,9 @@ v1/src/Operation/GetQueueOperation.php  Api\Queue\V1\Operation\GetQueueOperation
   key:service_type → p:Api\Queue\Entity\Queue::__construct#2 → p:Api\Queue\Entity\QueueNoId::__construct#1 → prop:Api\Queue\Entity\QueueNoId::serviceType → c:Api\Queue\Entity\Queue::getServiceType
 ```
 
-Korlátok: nincs SQL-parse (a kulcs a PHP-ból jön), dinamikus hívás / `__get` / `extract` esetén a lánc megszakad
-(`unknown`), a fixpont flow-érzéketlen (egy változó egy metódusban egy irokészlet). A `c:` visszatérés
+Korlátok: nincs SQL-parse (a kulcs a PHP-ból jön), dinamikus hívás esetén a lánc megszakad (`unknown`); a `__get` /
+`extract` / `fetchObject` eseteket may-only heurisztikák fedik (lásd lentebb). A fixpont flow-érzéketlen (egy változó
+egy metódusban egy irokészlet). A `c:` visszatérés
 híváspont-pontos: a `p:` paramétert az adott hívás argumentumai helyettesítik, így egy literál argumentumú hívás nem
 örökli más hívások oszlopát. A gettereken át olvasott `prop:` a létrehozási helyhez kötődik (konstruktor-argumentumok,
 `parent::__construct` forwarding, paraméteren át kapott objektum), a setter-írások és a `$this->m()` lánc pedig a hívás
@@ -115,12 +116,34 @@ olvasást akkor is, ha a property-t sosem írja PHP-kód. Prioritás: handler �
 - Legacy konstrukciók: `try`/`catch`/`finally`, `list()` / `[...]` destructuring, `yield` / `yield from`,
   `array_column($rows, 'oszlop')`, statikus `call_user_func([$this,'m'], …)`.
 
+## Recall heurisztikák (may-only)
+
+A bizonytalan olvasások felderítésére a trace közelítő szabályokat is használ. Ezek **csak may élt** adnak, must-ot
+soha:
+
+- ismeretlen fogadójú property-olvasás (`$row->name_en` `fetchObject` után) → `key:name_en`;
+- `__get` / `__set`-es osztályon a property-olvasás a property nevét is hordozza: `key:<prop>`;
+- `extract($row)` → az ismeretlen változó olvasása `key:<változó>`;
+- `get_object_vars($this)` → a `prop:this::*` uniója;
+- `compact('a', 'b')` → a változók eredeteinek uniója;
+- `match` értéke → az ágak eredeteinek uniója (a fogyasztó a kolónát látja);
+- `switch` fallthrough → sorrendben feldolgozva;
+- tömb pass-through (`array_values`, `array_filter`, `array_merge`, `array_slice`, `array_reverse`, `array_unique`,
+  `array_diff`, `array_intersect`, `array_splice`) → a tömbargumentumok uniója;
+- `array_map` → a callback visszatérési eredetei (arrow kifejezés, closure `return`, callable `c:` atom);
+- named argumentumok és `...$spread` → a konstruktor / függvény paramétereihez rendelve;
+- statikus property-k (`self::$x`) és `global` változók → hordozzák az eredetet;
+- `foreach` kulcs literálhoz hasonlítva → `key:<literál>`.
+
+Mivel ezek may-only közelítések, hamis pozitívumot adhatnak: pl. a `$row->name_en` nem feltétlenül DB-oszlop. A zajt a
+`--must` (csak a minden úton eljutó olvasások) és a `<tábla>.<oszlop>` szűrő (csak az adott tábla oszlopa) csökkenti.
+
 ## További korlátok
 
 - `extract($row)`, `fetchObject()` + `$row->oszlop`, `__get`/`__set`, `get_object_vars`, `foreach ($row as $k => $v)`
-  kulcsneve: továbbra sem követett (plugin/manual map szükséges).
+  kulcsneve: csak may heurisztikával követett, plugin/manual map továbbra is pontosabb.
 - A `prop:` `must` csak a konstruktor-írásokból számol; setterek must-ja konzervatív.
-- `switch`/`match` és ciklusok közelítők; a `match` értékének must-ja üres.
+- `switch`/`match` és ciklusok közelítők; a `match` értékének must-ja konzervatív (üres is lehet).
 
 ## Külső plugin (bármilyen nyelven)
 
