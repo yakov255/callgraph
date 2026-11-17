@@ -520,3 +520,64 @@ class UseCase
         read.expr
     );
 }
+
+#[test]
+fn must_marks_reads_reached_on_every_path() {
+    let dir = fixture_dir(
+        "path",
+        &[(
+            "src/UseCase.php",
+            r#"<?php
+namespace App;
+
+class UseCase
+{
+    public function maybe(array $row, bool $c): string
+    {
+        $name = 'default';
+        if ($c) {
+            $name = $row['name_en'];
+        }
+        return $name;
+    }
+
+    public function always(array $row): string
+    {
+        $name = $row['name_en'];
+        if ($row) {
+            $x = 1;
+        }
+        return $name;
+    }
+}
+
+class Runner
+{
+    public function runMaybe(array $row, bool $c): string
+    {
+        return (new UseCase())->maybe($row, $c);
+    }
+
+    public function runAlways(array $row): string
+    {
+        return (new UseCase())->always($row);
+    }
+}
+"#,
+        )],
+    );
+    let files = scan_flow(&dir).unwrap();
+    let index = Index::build(&files);
+    let traces = index.traces("name_en");
+    let _ = fs::remove_dir_all(&dir);
+
+    let must = |method: &str| {
+        traces
+            .iter()
+            .find(|trace| trace.method.ends_with(method))
+            .unwrap_or_else(|| panic!("no trace for {method}: {traces:#?}"))
+            .must
+    };
+    assert!(must("Runner::runAlways"), "{traces:#?}");
+    assert!(!must("Runner::runMaybe"), "{traces:#?}");
+}
