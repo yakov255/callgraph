@@ -648,7 +648,7 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
 
     // -- вызовы -------------------------------------------------------------
 
-    /// Вызов: рёбра аргументов, исток `c:<target>` и (для значения) чтение.
+    /// Вызов: рёбра аргументов, исток `c:<target>@<line>` и (для значения) чтение.
     fn call(&mut self, call: &Call<'a>, used: bool) -> Vec<String> {
         match call {
             Call::Method(node) => {
@@ -667,7 +667,7 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
         self.arguments(call.get_argument_list(), target.as_deref(), line);
         match target {
             Some(target) => {
-                let origins = vec![format!("c:{target}")];
+                let origins = vec![format!("c:{target}@{line}")];
                 if used {
                     self.record_read(call, origins.clone());
                 }
@@ -1356,7 +1356,7 @@ class Service
         assert!(
             read.origins
                 .iter()
-                .any(|atom| atom == "c:Item::getServiceType"),
+                .any(|atom| atom == "c:Item::getServiceType@27"),
             "{:?}",
             read.origins
         );
@@ -1412,9 +1412,56 @@ class Service
         assert!(
             read.origins
                 .iter()
-                .any(|atom| atom == "c:Item::getServiceType"),
+                .any(|atom| atom == "c:Item::getServiceType@30"),
             "{:?}",
             read.origins
+        );
+    }
+
+    #[test]
+    fn repeated_call_atoms_differ_by_line() {
+        let source = r#"<?php
+class A
+{
+    public function make($v)
+    {
+        return $v;
+    }
+
+    public function run($x, $y): void
+    {
+        $a = $this->make($x);
+        $b = $this->make($y);
+    }
+}
+"#;
+        let files = facts(source);
+        let run = method(&files, "A::run");
+        let atoms: Vec<&str> = run
+            .assigns
+            .iter()
+            .flat_map(|assign| assign.origins.iter())
+            .filter(|atom| atom.starts_with("c:A::make@"))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(atoms, vec!["c:A::make@11", "c:A::make@12"]);
+
+        let mut edges: Vec<(u32, usize, Vec<&str>)> = run
+            .args
+            .iter()
+            .filter(|edge| edge.target == "A::make")
+            .map(|edge| {
+                (
+                    edge.line,
+                    edge.index,
+                    edge.origins.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect();
+        edges.sort_by_key(|edge| edge.0);
+        assert_eq!(
+            edges,
+            vec![(11, 0, vec!["p:A::run#0"]), (12, 0, vec!["p:A::run#1"]),]
         );
     }
 

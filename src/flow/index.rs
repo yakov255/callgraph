@@ -3,6 +3,10 @@
 //! Индекс строится по локальным фактам `super::model::FlowFile`: возвраты методов, аргументы вызовов,
 //! присваивания и чтения. Истоки раскрываются до неподвижной точки, `traces` ищет чтения по имени
 //! ключа/колонки/property и восстанавливает цепочку атомов до чтения.
+//!
+//! Результат вызова с call-site (`c:<method>@<line>`) при сборке квалифицируется в
+//! `c:<method>@<file>#<line>`; такой атом раскрывает `p:<method>#<i>` аргументами именно своего вызова.
+//! Голый `c:<method>` без `@` остаётся и раскрывается глобально (обратная совместимость).
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 
@@ -34,6 +38,8 @@ pub struct Index {
     returns: HashMap<String, BTreeSet<String>>,
     /// Истоки аргументов по (цель вызова, индекс аргумента).
     args: HashMap<(String, usize), BTreeSet<String>>,
+    /// Истоки аргументов по (цель вызова, сайт `file#line`, индекс аргумента).
+    site_args: HashMap<(String, String, usize), BTreeSet<String>>,
     /// Истоки присваиваний по `lhs` (для property — `prop:<class>::<p>`).
     assigns: HashMap<String, BTreeSet<String>>,
     /// Все чтения проекта.
@@ -61,23 +67,35 @@ impl Index {
             for method in &file.methods {
                 let returns = index.returns.entry(method.id.clone()).or_default();
                 for ret in &method.returns {
-                    returns.extend(ret.origins.iter().cloned());
+                    returns.extend(ret.origins.iter().map(|origin| qualify(origin, &file.file)));
                 }
                 for assign in &method.assigns {
                     if assign.lhs.starts_with("prop:") {
-                        index
-                            .assigns
-                            .entry(assign.lhs.clone())
-                            .or_default()
-                            .extend(assign.origins.iter().cloned());
+                        index.assigns.entry(assign.lhs.clone()).or_default().extend(
+                            assign
+                                .origins
+                                .iter()
+                                .map(|origin| qualify(origin, &file.file)),
+                        );
                     }
                 }
                 for arg in &method.args {
+                    let site = format!("{}#{}", file.file, arg.line);
+                    let origins: Vec<String> = arg
+                        .origins
+                        .iter()
+                        .map(|origin| qualify(origin, &file.file))
+                        .collect();
                     index
                         .args
                         .entry((arg.target.clone(), arg.index))
                         .or_default()
-                        .extend(arg.origins.iter().cloned());
+                        .extend(origins.iter().cloned());
+                    index
+                        .site_args
+                        .entry((arg.target.clone(), site, arg.index))
+                        .or_default()
+                        .extend(origins);
                 }
                 for read in &method.reads {
                     index.reads.push(ReadFact {
@@ -85,7 +103,11 @@ impl Index {
                         method: method.id.clone(),
                         line: read.line,
                         expr: read.expr.clone(),
-                        origins: read.origins.clone(),
+                        origins: read
+                            .origins
+                            .iter()
+                            .map(|origin| qualify(origin, &file.file))
+                            .collect(),
                     });
                 }
             }
@@ -145,14 +167,31 @@ impl Index {
             return self.assigns.get(atom).cloned().unwrap_or_default();
         }
         if let Some(rest) = atom.strip_prefix("c:") {
-            if let Some((class, method)) = rest.rsplit_once("::") {
-                if let Some(set) = self.returns_for(class, method) {
-                    return set.clone();
+            let (target, site) = split_call(rest);
+            let Some(origins) = self.returns_for_target(target) else {
+                return BTreeSet::new();
+            };
+            let Some(site) = site else {
+                // Голый `c:<method>`: текущее глобальное раскрытие.
+                return origins.clone();
+            };
+            let mut set = BTreeSet::new();
+            for origin in origins {
+                if let Some((param_target, index)) = parse_param(origin) {
+                    // Собственный параметр метода (в т.ч. унаследованного с тем же именем):
+                    // аргументы именно этого вызова; их отсутствие — пустой набор, не глобальные.
+                    if same_method(param_target, target) {
+                        if let Some(args) = self.site_args_for(target, site, index) {
+                            set.extend(args.iter().cloned());
+                        }
+                        continue;
+                    }
                 }
-            } else {
-                return self.returns.get(rest).cloned().unwrap_or_default();
+                // Прочие истоки (включая `p:<other>#<i>`) раскрываются обычным путём:
+                // `p:` берёт глобальные аргументы.
+                set.insert(origin.clone());
             }
-            return BTreeSet::new();
+            return set;
         }
         if let Some(rest) = atom.strip_prefix("p:")
             && let Some((target, index)) = rest.rsplit_once('#')
@@ -162,6 +201,20 @@ impl Index {
             return set.clone();
         }
         BTreeSet::new()
+    }
+
+    /// Истоки возвратов по цели вызова: `Класс::метод` с наследованием, иначе точный id (функция).
+    fn returns_for_target(&self, target: &str) -> Option<&BTreeSet<String>> {
+        match target.rsplit_once("::") {
+            Some((class, method)) => self.returns_for(class, method),
+            None => self.returns.get(target),
+        }
+    }
+
+    /// Аргументы сайта `(цель, сайт, индекс)`; отсутствие — вызов без аргументов на этом сайте.
+    fn site_args_for(&self, target: &str, site: &str, index: usize) -> Option<&BTreeSet<String>> {
+        self.site_args
+            .get(&(target.to_string(), site.to_string(), index))
     }
 
     /// Истоки возвратов метода: точный id, иначе первый родитель с точным `Родитель::метод`.
@@ -295,7 +348,7 @@ impl Index {
         origins.dedup();
         for origin in origins {
             if origin == matched {
-                return vec![matched.to_string()];
+                return vec![display_atom(matched)];
             }
             let contains = self
                 .expanded
@@ -305,10 +358,10 @@ impl Index {
                 continue;
             }
             if let Some(path) = self.path(origin, matched) {
-                return path;
+                return path.iter().map(|atom| display_atom(atom)).collect();
             }
         }
-        vec![matched.to_string()]
+        vec![display_atom(matched)]
     }
 
     /// Путь по рёбрам раскрытия от `from` к `to`; возвращается в порядке «источник → чтение».
@@ -352,6 +405,68 @@ impl Index {
     }
 }
 
+/// Квалификация call-site атома: `c:<method>@<line>` → `c:<method>@<file>#<line>`.
+/// Атом без `@`, без номера строки или уже с `#` после `@` не меняется.
+fn qualify(origin: &str, file: &str) -> String {
+    let Some(rest) = origin.strip_prefix("c:") else {
+        return origin.to_string();
+    };
+    let Some((method, line)) = rest.split_once('@') else {
+        return origin.to_string();
+    };
+    if method.is_empty()
+        || line.is_empty()
+        || line.contains('#')
+        || !line.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return origin.to_string();
+    }
+    format!("c:{method}@{file}#{line}")
+}
+
+/// Разбор тела `c:`-атома на цель и сайт `file#line` (только для квалифицированного атома).
+fn split_call(rest: &str) -> (&str, Option<&str>) {
+    match rest.split_once('@') {
+        Some((method, site)) if site.contains('#') && !method.is_empty() => (method, Some(site)),
+        _ => (rest, None),
+    }
+}
+
+/// `c:`-атом без call-site суффикса `@<file>#<line>`.
+fn call_base(atom: &str) -> &str {
+    let Some(rest) = atom.strip_prefix("c:") else {
+        return atom;
+    };
+    match rest.split_once('@') {
+        Some((method, site)) if site.contains('#') && !method.is_empty() => {
+            &atom[..2 + method.len()]
+        }
+        _ => atom,
+    }
+}
+
+/// Атом для выдачи: call-site суффикс скрывается, цепочка остаётся читаемой.
+fn display_atom(atom: &str) -> String {
+    call_base(atom).to_string()
+}
+
+/// Разбор `p:<method>#<i>`.
+/// Совпадает ли имя метода у двух id (для унаследованного вызова: `Child::m` → `Parent::m`).
+fn same_method(left: &str, right: &str) -> bool {
+    let method = |id: &str| id.rsplit_once("::").map(|(_, m)| m.to_owned());
+    match (method(left), method(right)) {
+        (Some(a), Some(b)) => a == b,
+        (None, None) => left == right,
+        _ => false,
+    }
+}
+
+fn parse_param(atom: &str) -> Option<(&str, usize)> {
+    let rest = atom.strip_prefix("p:")?;
+    let (target, index) = rest.rsplit_once('#')?;
+    Some((target, index.parse().ok()?))
+}
+
 /// Нормализация терма: обрезка пробелов, снятие ведущих `$` и `@`.
 fn normalize_term(term: &str) -> String {
     let mut term = term.trim();
@@ -389,8 +504,9 @@ fn match_atom(
     prop.or(bare)
 }
 
-/// Последний сегмент атома после `::` или `.`.
+/// Последний сегмент атома после `::` или `.` (call-site суффикс не учитывается).
 fn last_segment(atom: &str) -> &str {
+    let atom = call_base(atom);
     let after_scope = atom.rsplit("::").next().unwrap_or(atom);
     after_scope.rsplit('.').next().unwrap_or(after_scope)
 }
@@ -468,6 +584,23 @@ mod tests {
         assert_eq!(index.traces("@service_type").len(), 1);
     }
 
+    /// Вызов без аргументов на своём сайте не наследует аргументы других вызовов того же метода.
+    #[test]
+    fn zero_arg_call_does_not_inherit_other_sites() {
+        let mut helper = method("H::isEn");
+        helper.params = 2;
+        helper.returns.push(read(2, "$v", &["p:H::isEn#0"]));
+        let mut user = method("A::use");
+        user.args.push(arg(10, "H::isEn", 0, &["key:name_en"]));
+        user.reads.push(read(11, "$a", &["c:H::isEn@10"]));
+        user.reads.push(read(12, "$b", &["c:H::isEn@12"]));
+        let index = Index::build(&[file("a.php", vec![helper, user])]);
+
+        let traces = index.traces("name_en");
+        assert_eq!(traces.len(), 1, "{traces:#?}");
+        assert_eq!(traces[0].line, 11);
+    }
+
     /// `p:<method>#<i>` раскрывается до истоков аргументов вызова.
     #[test]
     fn param_to_args_chain() {
@@ -543,5 +676,47 @@ mod tests {
         let index = Index::build(&[file("a.php", vec![repo])]);
         assert!(index.traces("name_en").is_empty());
         assert!(index.traces("   ").is_empty());
+    }
+
+    /// Два вызова `H::isEn` с разными аргументами: ключ приходит только из своего call-site.
+    fn call_site_index() -> Index {
+        let mut is_en = method("H::isEn");
+        is_en.returns.push(read(2, "$value", &["p:H::isEn#0"]));
+        let mut user = method("A::use");
+        user.args.push(arg(3, "H::isEn", 0, &["lit"]));
+        user.args.push(arg(5, "H::isEn", 0, &["key:name_en"]));
+        user.assigns.push(assign(3, "$a", &["c:H::isEn@3"]));
+        user.assigns.push(assign(5, "$b", &["c:H::isEn@5"]));
+        user.reads.push(read(4, "$a", &["c:H::isEn@3"]));
+        user.reads.push(read(6, "$b", &["c:H::isEn@5"]));
+        Index::build(&[file("/abs/file.php", vec![is_en, user])])
+    }
+
+    /// `c:<method>@<line>` раскрывает `p:<method>#<i>` аргументами именно своего вызова.
+    #[test]
+    fn call_site_precision() {
+        let index = call_site_index();
+        let traces = index.traces("name_en");
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0].line, 6);
+        assert_eq!(traces[0].expr, "$b");
+        assert!(has(&traces[0], "c:H::isEn") && has(&traces[0], "key:name_en"));
+    }
+
+    /// Цепочка скрывает call-site суффикс `@<file>#<line>`.
+    #[test]
+    fn chain_hides_call_site_suffix() {
+        let index = call_site_index();
+        let traces = index.traces("name_en");
+        assert_eq!(traces.len(), 1);
+        assert!(
+            traces[0].chain.iter().all(|atom| !atom.contains('@')),
+            "chain: {:?}",
+            traces[0].chain
+        );
+        assert_eq!(
+            traces[0].chain.last().map(String::as_str),
+            Some("c:H::isEn")
+        );
     }
 }
