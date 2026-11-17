@@ -281,3 +281,242 @@ class UseCase
         "the literal allocation inherited another object's column: {traces:#?}"
     );
 }
+
+#[test]
+fn setter_write_binds_to_the_allocation() {
+    let dir = fixture_dir(
+        "setter",
+        &[
+            (
+                "src/Item.php",
+                r#"<?php
+namespace App;
+
+class Item
+{
+    public function __construct(private string $name)
+    {
+    }
+
+    public function setName(string $name): void
+    {
+        $this->name = $name;
+    }
+
+    public function getName(): string
+    {
+        return $this->name;
+    }
+}
+"#,
+            ),
+            (
+                "src/UseCase.php",
+                r#"<?php
+namespace App;
+
+class UseCase
+{
+    public function literal(): void
+    {
+        $item = new Item('literal');
+        $item->setName('literal');
+        if ($item->getName()) {
+            $a = 1;
+        }
+    }
+
+    public function fromRow(): void
+    {
+        $row = $this->connection->fetchAssociative('SELECT * FROM items');
+        $item = new Item('start');
+        $item->setName($row['name_en']);
+        if ($item->getName()) {
+            $b = 2;
+        }
+    }
+}
+"#,
+            ),
+        ],
+    );
+    let files = scan_flow(&dir).unwrap();
+    let index = Index::build(&files);
+    let traces = index.traces("name_en");
+    let _ = fs::remove_dir_all(&dir);
+
+    assert!(
+        traces
+            .iter()
+            .any(|trace| trace.method.ends_with("UseCase::fromRow")),
+        "the setter write did not bind to the allocation: {traces:#?}"
+    );
+    assert!(
+        !traces
+            .iter()
+            .any(|trace| trace.method.ends_with("UseCase::literal")),
+        "the literal setter write inherited another object's column: {traces:#?}"
+    );
+}
+
+#[test]
+fn this_chain_binds_to_the_enclosing_allocation() {
+    let dir = fixture_dir(
+        "this-chain",
+        &[
+            (
+                "src/Item.php",
+                r#"<?php
+namespace App;
+
+class Item
+{
+    public function __construct(private string $name)
+    {
+    }
+
+    public function load(): string
+    {
+        return $this->name;
+    }
+
+    public function run(): string
+    {
+        return $this->load();
+    }
+}
+"#,
+            ),
+            (
+                "src/UseCase.php",
+                r#"<?php
+namespace App;
+
+class UseCase
+{
+    public function literal(): void
+    {
+        $item = new Item('literal');
+        if ($item->run()) {
+            $a = 1;
+        }
+    }
+
+    public function fromRow(): void
+    {
+        $row = $this->connection->fetchAssociative('SELECT * FROM items');
+        $item = new Item($row['name_en']);
+        if ($item->run()) {
+            $b = 2;
+        }
+    }
+}
+"#,
+            ),
+        ],
+    );
+    let files = scan_flow(&dir).unwrap();
+    let index = Index::build(&files);
+    let traces = index.traces("name_en");
+    let _ = fs::remove_dir_all(&dir);
+
+    let matching = traces
+        .iter()
+        .filter(|trace| trace.method.ends_with("UseCase::fromRow") && trace.expr.contains("run"))
+        .collect::<Vec<_>>();
+    assert!(
+        !matching.is_empty(),
+        "the this-chain did not bind to the enclosing allocation: {traces:#?}"
+    );
+    assert!(
+        matching
+            .iter()
+            .any(|trace| trace.chain.iter().any(|atom| atom.contains("load"))),
+        "the this-chain did not pass through load: {matching:#?}"
+    );
+    assert!(
+        !traces
+            .iter()
+            .any(|trace| trace.method.ends_with("UseCase::literal") && trace.expr.contains("run")),
+        "the literal allocation inherited the chain: {traces:#?}"
+    );
+}
+
+#[test]
+fn setter_through_parameter_binds() {
+    let dir = fixture_dir(
+        "setter-param",
+        &[
+            (
+                "src/Item.php",
+                r#"<?php
+namespace App;
+
+class Item
+{
+    public function __construct(private string $name)
+    {
+    }
+
+    public function setName(string $name): void
+    {
+        $this->name = $name;
+    }
+
+    public function getName(): string
+    {
+        return $this->name;
+    }
+}
+"#,
+            ),
+            (
+                "src/Applier.php",
+                r#"<?php
+namespace App;
+
+class Applier
+{
+    public function apply(Item $item, string $value): void
+    {
+        $item->setName($value);
+    }
+}
+"#,
+            ),
+            (
+                "src/UseCase.php",
+                r#"<?php
+namespace App;
+
+class UseCase
+{
+    public function run(): void
+    {
+        $row = $this->connection->fetchAssociative('SELECT * FROM items');
+        $item = new Item('start');
+        (new Applier())->apply($item, $row['name_en']);
+        if ($item->getName()) {
+            $a = 1;
+        }
+    }
+}
+"#,
+            ),
+        ],
+    );
+    let files = scan_flow(&dir).unwrap();
+    let index = Index::build(&files);
+    let traces = index.traces("name_en");
+    let _ = fs::remove_dir_all(&dir);
+
+    let read = traces
+        .iter()
+        .find(|trace| trace.method.ends_with("UseCase::run") && trace.expr.contains("getName"))
+        .unwrap_or_else(|| panic!("the setter through a parameter did not bind: {traces:#?}"));
+    assert!(
+        read.expr.contains("getName"),
+        "unexpected read expr: {}",
+        read.expr
+    );
+}
