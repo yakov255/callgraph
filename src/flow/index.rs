@@ -20,8 +20,52 @@
 
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::sync::OnceLock;
 
 use super::model::{FlowFile, Trace};
+
+/// Ключ кэша раскрытия: атом, контекст получателя, глубина.
+type ClosureKey = (String, String, usize);
+/// Кэш раскрытия атомов.
+type ClosureCache = HashMap<ClosureKey, BTreeSet<String>>;
+
+/// Временная диагностика: `CALLGRAPH_TIMING=1` печатает счётчики в stderr.
+fn timing() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CALLGRAPH_TIMING").is_some())
+}
+
+/// Текущий RSS процесса в КиБ (диагностика).
+fn rss_kb() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("VmRSS:"))
+                .and_then(|rest| rest.split_whitespace().next()?.parse().ok())
+        })
+        .unwrap_or(0)
+}
+
+fn timing_report(index: &Index) {
+    if !timing() {
+        return;
+    }
+    let cache = index.ctx_expanded.borrow();
+    let atoms: usize = cache.values().map(BTreeSet::len).sum();
+    let origins: usize = index.reads.iter().map(|read| read.origins.len()).sum();
+    let expanded_atoms: usize = index.expanded.values().map(Vec::len).sum();
+    eprintln!(
+        "timing: reads={} origins={} expanded={} expanded_atoms={} ctx_entries={} ctx_atoms={}",
+        index.reads.len(),
+        origins,
+        index.expanded.len(),
+        expanded_atoms,
+        cache.len(),
+        atoms
+    );
+}
 
 /// Предел числа атомов в одном раскрытом множестве.
 const ATOM_LIMIT: usize = 32;
@@ -97,10 +141,12 @@ pub struct Index {
     prop_must: HashMap<String, BTreeSet<String>>,
     /// Сопоставление `(класс, property) → (таблица, колонка)`.
     mapping: HashMap<(String, String), (String, String)>,
-    /// Транзитивное раскрытие каждого встреченного атома.
-    expanded: HashMap<String, BTreeSet<String>>,
+    /// Транзитивное раскрытие каждого встреченного атома (id → отсортированные id).
+    expanded: HashMap<u32, Vec<u32>>,
+    /// Идентификатор атома по имени.
+    atom_ids: HashMap<String, u32>,
     /// Кэш раскрытия с контекстом получателя: (атом, контекст, глубина) → множество.
-    ctx_expanded: std::cell::RefCell<HashMap<(String, String, usize), BTreeSet<String>>>,
+    ctx_expanded: std::cell::RefCell<ClosureCache>,
 }
 
 impl Index {
@@ -121,6 +167,7 @@ impl Index {
         parents: &HashMap<String, Vec<String>>,
         mapping: &crate::flow::Mapping,
     ) -> Self {
+        let build_at = std::time::Instant::now();
         let mut index = Self {
             parents: parents.clone(),
             mapping: mapping
@@ -331,7 +378,19 @@ impl Index {
             }
         }
         index.build_setter_writes();
+        if timing() {
+            eprintln!("timing: facts={:?} rss={}KB", build_at.elapsed(), rss_kb());
+        }
+        let at = std::time::Instant::now();
         index.fixpoint();
+        if timing() {
+            eprintln!(
+                "timing: fixpoint={:?} reads={} rss={}KB",
+                at.elapsed(),
+                index.reads.len(),
+                rss_kb()
+            );
+        }
         index
     }
 
@@ -349,6 +408,7 @@ impl Index {
             })
             .collect();
         self.expanded.clear();
+        self.atom_ids.clear();
         self.ctx_expanded.borrow_mut().clear();
         self.fixpoint();
         self
@@ -362,9 +422,27 @@ impl Index {
         }
         let key_atom = format!("key:{term}");
         let prop_suffix = format!("::{term}");
+        // Дешёвый предварительный отбор: свернуть раскрытие каждого истока в сводку совпадений,
+        // не материализуя множества. Материализация — только для чтений, которые могут совпасть.
+        let matcher = Matcher::new(&term, &key_atom, &prop_suffix);
+        let empty = BTreeSet::new();
+        let mut summaries = SummaryMemo::default();
         let mut traces = Vec::new();
+        let started = std::time::Instant::now();
+        let mut expanded_reads = 0usize;
+        let mut expand_nanos = 0u128;
         for read in &self.reads {
+            let mut hit = Hit::default();
+            for origin in &read.origins {
+                hit.merge(self.match_closure(origin, &empty, 0, &matcher, &mut summaries));
+            }
+            if !hit.possible(&matcher) {
+                continue;
+            }
+            let at = std::time::Instant::now();
             let set = self.read_origins(read);
+            expand_nanos += at.elapsed().as_nanos();
+            expanded_reads += 1;
             let mut pair = None;
             let matched = match match_atom(&set, &term, &key_atom, &prop_suffix) {
                 Some(found) => Some(found),
@@ -394,7 +472,7 @@ impl Index {
             traces.push(Trace {
                 must: must_flag,
                 column,
-                chain: self.chain(read, &matched),
+                chain: self.chain(read, &matched, &set),
                 file: read.file.clone(),
                 method: read.method.clone(),
                 line: read.line,
@@ -414,6 +492,16 @@ impl Index {
                 && left.column == right.column
         });
         traces.truncate(TRACE_LIMIT);
+        if timing() {
+            eprintln!(
+                "timing: term={term} reads={expanded_reads} matched_at_scan={} scroll={:?} expand={:?} cache_entries={}",
+                traces.len(),
+                started.elapsed(),
+                std::time::Duration::from_nanos(expand_nanos as u64),
+                self.ctx_expanded.borrow().len()
+            );
+            timing_report(self);
+        }
         traces
     }
 
@@ -456,22 +544,51 @@ impl Index {
 
     /// Транзитивное раскрытие атома для сопоставления чтений: вложенный вызов `$this->m()`
     /// наследует получателей вызывающего, поэтому контекст пробрасывается по цепочке.
-    fn expand_closure(&self, atom: &str, ctx: &BTreeSet<String>, depth: usize) -> BTreeSet<String> {
+    /// На верхнем уровне (глубина 0) результат кэшируется между чтениями, вложенные шаги —
+    /// только на одно чтение: их кэш иначе разрастается на весь проект.
+    fn expand_closure(
+        &self,
+        atom: &str,
+        ctx: &BTreeSet<String>,
+        depth: usize,
+        local: &mut ClosureCache,
+    ) -> BTreeSet<String> {
         let ctx = cap_ctx(ctx);
         let key = (atom.to_string(), ctx_key(&ctx), depth);
-        if let Some(cached) = self.ctx_expanded.borrow().get(&key) {
+        if depth == 0 {
+            if let Some(cached) = self.ctx_expanded.borrow().get(&key) {
+                return cached.clone();
+            }
+            // Заглушка от циклов: повторный вход в тот же ключ даёт пустое множество.
+            self.ctx_expanded
+                .borrow_mut()
+                .insert(key.clone(), BTreeSet::new());
+            let set = self.expand_closure_body(atom, &ctx, depth, local);
+            self.ctx_expanded.borrow_mut().insert(key, set.clone());
+            return set;
+        }
+        if let Some(cached) = local.get(&key) {
             return cached.clone();
         }
-        // Заглушка от циклов: повторный вход в тот же ключ даёт пустое множество.
-        self.ctx_expanded
-            .borrow_mut()
-            .insert(key.clone(), BTreeSet::new());
+        local.insert(key.clone(), BTreeSet::new());
+        let set = self.expand_closure_body(atom, &ctx, depth, local);
+        local.insert(key, set.clone());
+        set
+    }
+
+    /// Тело раскрытия: сам атом плюс шаг по рёбрам.
+    fn expand_closure_body(
+        &self,
+        atom: &str,
+        ctx: &BTreeSet<String>,
+        depth: usize,
+        local: &mut ClosureCache,
+    ) -> BTreeSet<String> {
         let mut set = BTreeSet::new();
         set.insert(atom.to_string());
         if depth < CONTEXT_DEPTH {
-            self.closure_step(atom, &ctx, depth + 1, &mut set);
+            self.closure_step(atom, ctx, depth + 1, local, &mut set);
         }
-        self.ctx_expanded.borrow_mut().insert(key, set.clone());
         set
     }
 
@@ -482,6 +599,7 @@ impl Index {
         atom: &str,
         ctx: &BTreeSet<String>,
         depth: usize,
+        local: &mut ClosureCache,
         set: &mut BTreeSet<String>,
     ) {
         let call = atom
@@ -490,7 +608,7 @@ impl Index {
             .and_then(|(target, site)| site.map(|site| (target, site)));
         let Some((target, site)) = call else {
             for child in self.raw_direct(atom) {
-                set.extend(self.expand_closure(&child, ctx, depth));
+                set.extend(self.expand_closure(&child, ctx, depth, local));
             }
             return;
         };
@@ -505,11 +623,11 @@ impl Index {
         for origin in &origins {
             if is_this_property(origin) {
                 if allocations.is_empty() {
-                    set.extend(self.expand_closure(origin, ctx, depth));
+                    set.extend(self.expand_closure(origin, ctx, depth, local));
                 } else {
                     for (class, allocation_site) in &allocations {
                         let property = format!("{origin}@new:{class}@{allocation_site}");
-                        set.extend(self.expand_closure(&property, ctx, depth));
+                        set.extend(self.expand_closure(&property, ctx, depth, local));
                     }
                 }
                 continue;
@@ -519,7 +637,7 @@ impl Index {
             {
                 if let Some(args) = self.call_args(target, site, index) {
                     for arg in args {
-                        set.extend(self.expand_closure(&arg, ctx, depth));
+                        set.extend(self.expand_closure(&arg, ctx, depth, local));
                     }
                 }
                 continue;
@@ -530,7 +648,93 @@ impl Index {
             } else {
                 ctx
             };
-            set.extend(self.expand_closure(origin, child_ctx, depth));
+            set.extend(self.expand_closure(origin, child_ctx, depth, local));
+        }
+    }
+
+    /// Сводка раскрытия для предварительного отбора: та же рекурсия, что `expand_closure`,
+    /// но вместо множества атомов копится только то, что может совпасть с термом.
+    fn match_closure(
+        &self,
+        atom: &str,
+        ctx: &BTreeSet<String>,
+        depth: usize,
+        matcher: &Matcher<'_>,
+        memo: &mut SummaryMemo,
+    ) -> Hit {
+        let ctx = cap_ctx(ctx);
+        let atom_id = memo.atoms.intern(atom);
+        let ctx_id = memo.contexts.intern(&ctx_key(&ctx));
+        let key = (atom_id, ctx_id, depth);
+        if let Some(cached) = memo.hits.get(&key) {
+            return *cached;
+        }
+        // Заглушка от циклов: повторный вход в тот же ключ даёт пустую сводку.
+        memo.hits.insert(key, Hit::default());
+        let mut hit = matcher.classify(atom);
+        if depth < CONTEXT_DEPTH {
+            self.match_step(atom, &ctx, depth + 1, matcher, memo, &mut hit);
+        }
+        memo.hits.insert(key, hit);
+        hit
+    }
+
+    /// Шаг сводки, повторяющий `closure_step` один в один.
+    fn match_step(
+        &self,
+        atom: &str,
+        ctx: &BTreeSet<String>,
+        depth: usize,
+        matcher: &Matcher<'_>,
+        memo: &mut SummaryMemo,
+        hit: &mut Hit,
+    ) {
+        let call = atom
+            .strip_prefix("c:")
+            .map(split_call)
+            .and_then(|(target, site)| site.map(|site| (target, site)));
+        let Some((target, site)) = call else {
+            for child in self.raw_direct(atom) {
+                hit.merge(self.match_closure(&child, ctx, depth, matcher, memo));
+            }
+            return;
+        };
+        let Some(origins) = self.returns_for_call(target) else {
+            return;
+        };
+        let allocations = self.site_allocations(target, site, ctx);
+        let callee_ctx: BTreeSet<String> = allocations
+            .iter()
+            .map(|(class, allocation_site)| format!("new:{class}@{allocation_site}"))
+            .collect();
+        for origin in &origins {
+            if is_this_property(origin) {
+                if allocations.is_empty() {
+                    hit.merge(self.match_closure(origin, ctx, depth, matcher, memo));
+                } else {
+                    for (class, allocation_site) in &allocations {
+                        let property = format!("{origin}@new:{class}@{allocation_site}");
+                        hit.merge(self.match_closure(&property, ctx, depth, matcher, memo));
+                    }
+                }
+                continue;
+            }
+            if let Some((param_target, index)) = parse_param(origin)
+                && same_method(param_target, target)
+            {
+                if let Some(args) = self.call_args(target, site, index) {
+                    for arg in args {
+                        hit.merge(self.match_closure(&arg, ctx, depth, matcher, memo));
+                    }
+                }
+                continue;
+            }
+            let child_ctx = if origin.starts_with("c:") {
+                &callee_ctx
+            } else {
+                ctx
+            };
+            hit.merge(self.match_closure(origin, child_ctx, depth, matcher, memo));
         }
     }
 
@@ -1090,54 +1294,113 @@ impl Index {
     }
 
     /// Фикспойнт: множество атома = потомки ∪ раскрытие потомков, с пределом на размер.
+    /// Внутри считается по числовым id: id назначаются в лексикографическом порядке имён,
+    /// поэтому порядок id совпадает с порядком `BTreeSet<String>`.
     fn fixpoint(&mut self) {
         let mut atoms = self.all_atoms();
+        // Прямые потомки не зависят от `expanded`: считаем их один раз на атом, а не в каждой итерации.
+        let mut directs: HashMap<String, BTreeSet<String>> = HashMap::new();
         // Замыкание по рёбрам раскрытия: найденный потомок тоже должен быть раскрыт.
         let mut queue: Vec<String> = atoms.iter().cloned().collect();
         while let Some(atom) = queue.pop() {
-            for child in self.direct(&atom) {
+            let children = self.direct(&atom);
+            for child in &children {
                 if atoms.insert(child.clone()) {
-                    queue.push(child);
+                    queue.push(child.clone());
                 }
             }
+            if !children.is_empty() {
+                directs.insert(atom, children);
+            }
         }
-        for atom in &atoms {
-            self.expanded.entry(atom.clone()).or_default();
+        let names: Vec<String> = atoms.into_iter().collect();
+        let ids: HashMap<String, u32> = names
+            .iter()
+            .enumerate()
+            .map(|(id, name)| (name.clone(), id as u32))
+            .collect();
+        let mut direct_ids: Vec<Option<Vec<u32>>> = vec![None; names.len()];
+        let mut parents: Vec<Vec<u32>> = vec![Vec::new(); names.len()];
+        for (name, children) in directs {
+            let Some(&id) = ids.get(&name) else {
+                continue;
+            };
+            let children: Vec<u32> = children
+                .iter()
+                .filter_map(|child| ids.get(child).copied())
+                .collect();
+            for &child in &children {
+                parents[child as usize].push(id);
+            }
+            if !children.is_empty() {
+                direct_ids[id as usize] = Some(children);
+            }
         }
-        for _ in 0..ITERATION_LIMIT {
-            let mut changed = false;
-            for atom in &atoms {
-                let mut set = self.direct(atom);
-                let children: Vec<String> = set.iter().cloned().collect();
-                for child in children {
-                    if let Some(inner) = self.expanded.get(&child) {
-                        set.extend(inner.iter().cloned());
+        // Пустые множества не храним: отсутствие записи и есть пустое раскрытие.
+        // Раунд пересчитывает атом, только если у него изменился потомок. Порядок тот же, что
+        // у полного прохода по `atoms`: потомок раньше по порядку обновляется в этом же раунде,
+        // позже — в следующем. Поэтому результат совпадает с полным проходом.
+        let mut expanded: HashMap<u32, Vec<u32>> = HashMap::new();
+        let mut todo: BTreeSet<u32> = (0..names.len() as u32).collect();
+        let mut rounds = 0usize;
+        let rounds_at = std::time::Instant::now();
+        while !todo.is_empty() && rounds < ITERATION_LIMIT {
+            rounds += 1;
+            let mut next: BTreeSet<u32> = BTreeSet::new();
+            while let Some(atom) = todo.pop_first() {
+                let Some(children) = direct_ids[atom as usize].as_ref() else {
+                    continue;
+                };
+                let mut set = children.clone();
+                for &child in children {
+                    if let Some(inner) = expanded.get(&child) {
+                        set.extend_from_slice(inner);
                     }
                 }
-                while set.len() > ATOM_LIMIT {
-                    let Some(last) = set.iter().next_back().cloned() else {
-                        break;
-                    };
-                    set.remove(&last);
+                set.sort_unstable();
+                set.dedup();
+                set.truncate(ATOM_LIMIT);
+                let changed = expanded
+                    .get(&atom)
+                    .map_or(!set.is_empty(), |current| current != &set);
+                if !changed {
+                    continue;
                 }
-                if self.expanded.get(atom) != Some(&set) {
-                    self.expanded.insert(atom.clone(), set);
-                    changed = true;
+                if set.is_empty() {
+                    expanded.remove(&atom);
+                } else {
+                    expanded.insert(atom, set);
+                }
+                for &parent in &parents[atom as usize] {
+                    // Родитель позже по порядку — ещё успевает в этом раунде.
+                    if parent > atom {
+                        todo.insert(parent);
+                    } else {
+                        next.insert(parent);
+                    }
                 }
             }
-            if !changed {
-                break;
-            }
+            todo = next;
         }
+        if timing() {
+            eprintln!(
+                "timing: fixpoint rounds={rounds} rounds_took={:?}",
+                rounds_at.elapsed()
+            );
+        }
+        self.atom_ids = ids;
+        self.expanded = expanded;
     }
 
     /// Полное множество истоков чтения: сами истоки плюс раскрытие с контекстом получателя.
     /// Пары `key:<column>` + `row:<table>` достраиваются до `sql:<table>.<column>`.
     fn read_origins(&self, read: &ReadFact) -> BTreeSet<String> {
         let mut set = BTreeSet::new();
+        let empty = BTreeSet::new();
+        let mut local = HashMap::new();
         for origin in &read.origins {
             set.insert(origin.clone());
-            set.extend(self.expand_closure(origin, &BTreeSet::new(), 0));
+            set.extend(self.expand_closure(origin, &empty, 0, &mut local));
         }
         set
     }
@@ -1250,8 +1513,8 @@ impl Index {
 
     /// Цепочка от совпавшего атома до истока чтения, который его содержит.
     /// `sql:`-атом, полученный из пары `key:` + `row:`, показывается вместе с этой парой.
-    fn chain(&self, read: &ReadFact, matched: &str) -> Vec<String> {
-        let pairs = self.read_pairs(read);
+    fn chain(&self, read: &ReadFact, matched: &str, set: &BTreeSet<String>) -> Vec<String> {
+        let pairs = self.read_pairs(set);
         if let Some((_, key, row)) = pairs.iter().find(|pair| pair.0 == matched) {
             let mut chain = vec![display_atom(matched)];
             for atom in self.chain_path(read, key) {
@@ -1290,8 +1553,7 @@ impl Index {
     }
 
     /// Пары раскрытия чтения: `(sql:, key:, row:)` для каждого `key:<column>` × `row:<table>`.
-    fn read_pairs(&self, read: &ReadFact) -> Vec<(String, String, String)> {
-        let set = self.read_origins(read);
+    fn read_pairs(&self, set: &BTreeSet<String>) -> Vec<(String, String, String)> {
         let keys: Vec<&String> = set.iter().filter(|atom| atom.starts_with("key:")).collect();
         let rows: Vec<&String> = set.iter().filter(|atom| atom.starts_with("row:")).collect();
         let mut pairs = Vec::new();
@@ -1314,14 +1576,18 @@ impl Index {
         let mut origins: Vec<&String> = read.origins.iter().collect();
         origins.sort();
         origins.dedup();
+        let matched_id = self.atom_ids.get(matched).copied();
         for origin in origins {
             if origin == matched {
                 return vec![display_atom(matched)];
             }
-            let contains = self
-                .expanded
-                .get(origin)
-                .is_some_and(|set| set.contains(matched));
+            let contains = matched_id.is_some_and(|matched_id| {
+                self.atom_ids.get(origin.as_str()).is_some_and(|origin_id| {
+                    self.expanded
+                        .get(origin_id)
+                        .is_some_and(|set| set.contains(&matched_id))
+                })
+            });
             if !contains {
                 continue;
             }
@@ -1577,6 +1843,126 @@ fn normalize_term(term: &str) -> String {
         term = rest;
     }
     term.to_string()
+}
+
+/// Что из раскрытия истока может совпасть с термом — без материализации множества.
+/// Достаточно факта наличия: точное совпадение `key:` и `sql:` (для квалифицированного терма),
+/// `prop:` по суффиксу, совпадение по последнему сегменту, пара `key:<column>` + `row:<table>`.
+#[derive(Debug, Clone, Copy, Default)]
+struct Hit {
+    key: bool,
+    sql: bool,
+    prop: bool,
+    bare: bool,
+    /// Есть `key:<column>`, где колонка равна части квалифицированного терма.
+    column_key: bool,
+    row: bool,
+}
+
+impl Hit {
+    fn merge(&mut self, other: Hit) {
+        self.key |= other.key;
+        self.sql |= other.sql;
+        self.prop |= other.prop;
+        self.bare |= other.bare;
+        self.column_key |= other.column_key;
+        self.row |= other.row;
+    }
+
+    /// Может ли сводка дать совпадение: прямой атом или (для `<table>.<column>`) пара `key:` + `row:`.
+    fn possible(&self, matcher: &Matcher<'_>) -> bool {
+        if self.key || self.sql || self.prop || self.bare {
+            return true;
+        }
+        matcher.qualified && self.row && self.column_key
+    }
+}
+
+/// Интернирование строк сводок: ключ кэша — числа, а не копии имён атомов.
+#[derive(Debug, Default)]
+struct Interner {
+    ids: HashMap<String, u32>,
+    names: Vec<String>,
+}
+
+impl Interner {
+    fn intern(&mut self, name: &str) -> u32 {
+        if let Some(&id) = self.ids.get(name) {
+            return id;
+        }
+        let id = self.names.len() as u32;
+        self.names.push(name.to_string());
+        self.ids.insert(name.to_string(), id);
+        id
+    }
+}
+
+/// Кэш сводок раскрытия на один вызов `traces`.
+#[derive(Debug, Default)]
+struct SummaryMemo {
+    atoms: Interner,
+    contexts: Interner,
+    hits: HashMap<(u32, u32, usize), Hit>,
+}
+
+/// Правила `match_atom` для одного атома.
+struct Matcher<'a> {
+    term: &'a str,
+    key_atom: &'a str,
+    prop_suffix: &'a str,
+    qualified: bool,
+    column: &'a str,
+}
+
+impl<'a> Matcher<'a> {
+    fn new(term: &'a str, key_atom: &'a str, prop_suffix: &'a str) -> Self {
+        let qualified = term.contains('.');
+        let column = term
+            .rsplit_once('.')
+            .map(|(_, column)| column)
+            .unwrap_or("");
+        Self {
+            term,
+            key_atom,
+            prop_suffix,
+            qualified,
+            column,
+        }
+    }
+
+    fn classify(&self, atom: &str) -> Hit {
+        let mut hit = Hit::default();
+        if atom == "lit" || atom == "unknown" {
+            return hit;
+        }
+        if atom == self.key_atom {
+            hit.key = true;
+            return hit;
+        }
+        if let Some(rest) = atom.strip_prefix("key:") {
+            if self.qualified && rest.eq_ignore_ascii_case(self.column) {
+                hit.column_key = true;
+            }
+        } else if atom.starts_with("row:") {
+            hit.row = true;
+        }
+        if let Some(value) = atom.strip_prefix("sql:") {
+            if self.qualified {
+                if value.eq_ignore_ascii_case(self.term) {
+                    hit.sql = true;
+                }
+            } else if last_segment(atom) == self.term {
+                hit.bare = true;
+            }
+            return hit;
+        }
+        if atom.starts_with("prop:") && atom.ends_with(self.prop_suffix) {
+            hit.prop = true;
+        } else if last_segment(atom) == self.term {
+            hit.bare = true;
+        }
+        hit
+    }
 }
 
 /// Совпавший атом: сначала `key:<term>`, затем `prop:...::<term>`, затем совпадение по последнему сегменту.
