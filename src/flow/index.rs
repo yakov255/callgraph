@@ -18,6 +18,7 @@
 //! вызывающего. Записи `$this->p` из сеттеров привязываются к месту создания через аргументы
 //! своего вызова (`setter_writes`).
 
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 
 use super::model::{FlowFile, Trace};
@@ -40,6 +41,8 @@ const CONTEXT_ATOM_LIMIT: usize = 8;
 const CONTEXT_DEPTH: usize = 12;
 /// Предел числа записей свойства, учитываемых для одного места создания.
 const SETTER_SITE_LIMIT: usize = 64;
+/// Предел глубины `must`-раскрытия атома.
+const MUST_DEPTH: usize = 6;
 
 /// Чтение с контекстом файла и метода.
 #[derive(Debug, Clone)]
@@ -49,6 +52,8 @@ struct ReadFact {
     line: u32,
     expr: String,
     origins: Vec<String>,
+    /// `must`-истоки чтения (см. `Read::must`).
+    must: Vec<String>,
 }
 
 /// Индекс по всем фактам проекта.
@@ -60,6 +65,12 @@ pub struct Index {
     args: HashMap<(String, usize), BTreeSet<String>>,
     /// Истоки аргументов по (цель вызова, сайт `file#line`, индекс аргумента).
     site_args: HashMap<(String, String, usize), BTreeSet<String>>,
+    /// `must`-истоки возвратов по id метода (пересечение всех `return`).
+    returns_must: HashMap<String, BTreeSet<String>>,
+    /// `must`-истоки аргументов по (цель вызова, индекс аргумента).
+    args_must: HashMap<(String, usize), BTreeSet<String>>,
+    /// `must`-истоки аргументов по (цель вызова, сайт `file#line`, индекс аргумента).
+    site_args_must: HashMap<(String, String, usize), BTreeSet<String>>,
     /// Истоки присваиваний по `lhs` (для property — `prop:<class>::<p>`).
     assigns: HashMap<String, BTreeSet<String>>,
     /// Записи `$this->p` из конструкторов: property → истоки (для привязки к месту создания).
@@ -96,6 +107,22 @@ impl Index {
         for file in files {
             for method in &file.methods {
                 let container = method.container.as_deref();
+                // Возврат метода гарантирует атом, только если его гарантирует каждый `return`.
+                let mut method_must: Option<BTreeSet<String>> = None;
+                for ret in &method.returns {
+                    let set: BTreeSet<String> = ret
+                        .must
+                        .iter()
+                        .map(|origin| qualify(origin, &file.file, container))
+                        .collect();
+                    method_must = Some(match method_must {
+                        Some(previous) => must_intersect(&previous, &set),
+                        None => set,
+                    });
+                }
+                if let Some(set) = method_must {
+                    must_merge(&mut index.returns_must, method.id.clone(), set);
+                }
                 let returns = index.returns.entry(method.id.clone()).or_default();
                 for ret in &method.returns {
                     returns.extend(
@@ -137,6 +164,12 @@ impl Index {
                         .iter()
                         .map(|origin| qualify(origin, &file.file, container))
                         .collect();
+                    // `must`: атом гарантирован, только если он гарантирован на всех сайтах.
+                    let must: BTreeSet<String> = arg
+                        .must
+                        .iter()
+                        .map(|origin| qualify(origin, &file.file, container))
+                        .collect();
                     index
                         .args
                         .entry((arg.target.clone(), arg.index))
@@ -144,9 +177,19 @@ impl Index {
                         .extend(origins.iter().cloned());
                     index
                         .site_args
-                        .entry((arg.target.clone(), site, arg.index))
+                        .entry((arg.target.clone(), site.clone(), arg.index))
                         .or_default()
                         .extend(origins);
+                    must_merge(
+                        &mut index.args_must,
+                        (arg.target.clone(), arg.index),
+                        must.clone(),
+                    );
+                    must_merge(
+                        &mut index.site_args_must,
+                        (arg.target.clone(), site, arg.index),
+                        must,
+                    );
                 }
                 for receiver in &method.receivers {
                     let site = format!("{}#{}", file.file, receiver.line);
@@ -169,6 +212,11 @@ impl Index {
                         expr: read.expr.clone(),
                         origins: read
                             .origins
+                            .iter()
+                            .map(|origin| qualify(origin, &file.file, container))
+                            .collect(),
+                        must: read
+                            .must
                             .iter()
                             .map(|origin| qualify(origin, &file.file, container))
                             .collect(),
@@ -201,7 +249,9 @@ impl Index {
             } else {
                 term.clone()
             };
+            let must = self.read_must(read);
             traces.push(Trace {
+                must: must_atom(&must, &matched),
                 column,
                 chain: self.chain(read, &matched),
                 file: read.file.clone(),
@@ -732,6 +782,106 @@ impl Index {
         set
     }
 
+    /// `must`-раскрытие атома: только гарантированные истоки. Любые отсутствующие данные
+    /// (property, `this`, неизвестный вызов) дают пустое множество.
+    fn must_expand(&self, atom: &str, depth: usize) -> BTreeSet<String> {
+        let mut set = BTreeSet::new();
+        if depth >= MUST_DEPTH {
+            return set;
+        }
+        // Записи property и `this` не несут `must`-данных.
+        if atom.starts_with("prop:") || atom == "this" {
+            return set;
+        }
+        // Терминальные атомы: исток сам по себе.
+        if atom.starts_with("key:")
+            || atom.starts_with("new:")
+            || atom == "lit"
+            || atom == "unknown"
+        {
+            set.insert(atom.to_string());
+            return set;
+        }
+        if let Some((target, index)) = parse_param(atom) {
+            if let Some(args) = self.args_must_for(target, index) {
+                for arg in args {
+                    set.extend(self.must_expand(arg, depth + 1));
+                }
+            }
+            return set;
+        }
+        let Some(rest) = atom.strip_prefix("c:") else {
+            return set;
+        };
+        let (target, site) = split_call(rest);
+        let Some(origins) = self.returns_must_for_target(target) else {
+            return set;
+        };
+        for origin in origins {
+            if let Some((param_target, index)) = parse_param(origin) {
+                // Параметр своего вызова — аргументы именно этого сайта, иначе глобальные.
+                let args = site
+                    .filter(|_| same_method(param_target, target))
+                    .and_then(|site| self.site_args_must_for(target, site, index))
+                    .or_else(|| self.args_must_for(param_target, index));
+                if let Some(args) = args {
+                    for arg in args {
+                        set.extend(self.must_expand(arg, depth + 1));
+                    }
+                }
+                continue;
+            }
+            set.extend(self.must_expand(origin, depth + 1));
+        }
+        set
+    }
+
+    /// `must`-замыкание чтения: раскрытие `read.must`; пусто — гарантии нет.
+    fn read_must(&self, read: &ReadFact) -> BTreeSet<String> {
+        let mut set = BTreeSet::new();
+        for origin in &read.must {
+            set.extend(self.must_expand(origin, 0));
+        }
+        set
+    }
+
+    /// `must`-истоки возвратов по цели вызова: как `returns_for_target`, но по `returns_must`.
+    fn returns_must_for_target(&self, target: &str) -> Option<&BTreeSet<String>> {
+        match target.rsplit_once("::") {
+            Some((class, method)) => self.returns_must_for(class, method),
+            None => self.returns_must.get(target),
+        }
+    }
+
+    /// `must`-истоки возвратов метода: точный id, иначе первый родитель с точным `Родитель::метод`.
+    fn returns_must_for(&self, class: &str, method: &str) -> Option<&BTreeSet<String>> {
+        let id = self.ancestor_method(class, method, |id| self.returns_must.contains_key(id))?;
+        self.returns_must.get(&id)
+    }
+
+    /// `must`-истоки аргументов: точная пара (цель, индекс), иначе первый родитель с точной парой.
+    fn args_must_for(&self, target: &str, index: usize) -> Option<&BTreeSet<String>> {
+        if let Some(set) = self.args_must.get(&(target.to_string(), index)) {
+            return Some(set);
+        }
+        let (class, method) = target.rsplit_once("::")?;
+        let id = self.ancestor_method(class, method, |id| {
+            self.args_must.contains_key(&(id.to_string(), index))
+        })?;
+        self.args_must.get(&(id, index))
+    }
+
+    /// `must`-аргументы сайта `(цель, сайт, индекс)`; отсутствие — нет гарантии.
+    fn site_args_must_for(
+        &self,
+        target: &str,
+        site: &str,
+        index: usize,
+    ) -> Option<&BTreeSet<String>> {
+        self.site_args_must
+            .get(&(target.to_string(), site.to_string(), index))
+    }
+
     /// Цепочка от совпавшего атома до истока чтения, который его содержит.
     fn chain(&self, read: &ReadFact, matched: &str) -> Vec<String> {
         let mut origins: Vec<&String> = read.origins.iter().collect();
@@ -888,6 +1038,34 @@ fn display_atom(atom: &str) -> String {
     atom_base(atom).to_string()
 }
 
+/// Пересечение двух `must`-множеств.
+fn must_intersect(left: &BTreeSet<String>, right: &BTreeSet<String>) -> BTreeSet<String> {
+    left.intersection(right).cloned().collect()
+}
+
+/// Записать `must`-множество под ключ: повторный сайт сужает его пересечением.
+fn must_merge<K: std::hash::Hash + Eq>(
+    map: &mut HashMap<K, BTreeSet<String>>,
+    key: K,
+    set: BTreeSet<String>,
+) {
+    match map.entry(key) {
+        Entry::Vacant(slot) => {
+            slot.insert(set);
+        }
+        Entry::Occupied(mut slot) => {
+            let kept = must_intersect(slot.get(), &set);
+            slot.insert(kept);
+        }
+    }
+}
+
+/// Совпавший атом гарантирован на каждом пути: его база есть в `must`-замыкании.
+fn must_atom(must: &BTreeSet<String>, matched: &str) -> bool {
+    let base = atom_base(matched);
+    must.iter().any(|atom| atom_base(atom) == base)
+}
+
 /// Свойство текущего объекта: `prop:this::<p>` или квалифицированный `prop:this:<class>::<p>`.
 fn is_this_property(atom: &str) -> bool {
     atom.starts_with("prop:this:")
@@ -976,6 +1154,16 @@ mod tests {
             line,
             expr: expr.into(),
             origins: origins.iter().map(|origin| (*origin).to_string()).collect(),
+            must: Vec::new(),
+        }
+    }
+
+    fn read_must(line: u32, expr: &str, origins: &[&str], must: &[&str]) -> Read {
+        Read {
+            line,
+            expr: expr.into(),
+            origins: origins.iter().map(|origin| (*origin).to_string()).collect(),
+            must: must.iter().map(|origin| (*origin).to_string()).collect(),
         }
     }
 
@@ -1007,6 +1195,17 @@ mod tests {
             target: target.into(),
             index,
             origins: origins.iter().map(|origin| (*origin).to_string()).collect(),
+            must: Vec::new(),
+        }
+    }
+
+    fn arg_must(line: u32, target: &str, index: usize, origins: &[&str], must: &[&str]) -> ArgEdge {
+        ArgEdge {
+            line,
+            target: target.into(),
+            index,
+            origins: origins.iter().map(|origin| (*origin).to_string()).collect(),
+            must: must.iter().map(|origin| (*origin).to_string()).collect(),
         }
     }
 
@@ -1490,5 +1689,89 @@ mod tests {
         let traces = index.traces("name_en");
         assert_eq!(traces.len(), 1, "{traces:#?}");
         assert_eq!(traces[0].line, 9);
+    }
+
+    /// Чтение с `must`-истоком: колонка доходит на каждом пути.
+    #[test]
+    fn must_is_true_when_the_read_is_must() {
+        let mut run = method("A::run");
+        run.reads.push(read_must(
+            4,
+            "$row['name_en']",
+            &["key:name_en"],
+            &["key:name_en"],
+        ));
+        let index = Index::build(&[file("a.php", vec![run])]);
+
+        let traces = index.traces("name_en");
+        assert_eq!(traces.len(), 1, "{traces:#?}");
+        assert!(traces[0].must);
+    }
+
+    /// `must` чтения пуст: совпадение только may.
+    #[test]
+    fn must_is_false_for_a_may_only_read() {
+        let mut run = method("A::run");
+        run.reads.push(read(4, "$row['name_en']", &["key:name_en"]));
+        let index = Index::build(&[file("a.php", vec![run])]);
+
+        let traces = index.traces("name_en");
+        assert_eq!(traces.len(), 1, "{traces:#?}");
+        assert!(!traces[0].must);
+    }
+
+    /// Возврат метода гарантирован: `must` идёт по цепочке вызова.
+    #[test]
+    fn must_follows_a_must_return() {
+        let mut get = method("A::get");
+        get.returns.push(read_must(
+            3,
+            "$row['name_en']",
+            &["key:name_en"],
+            &["key:name_en"],
+        ));
+        let mut run = method("A::run");
+        run.reads
+            .push(read_must(9, "$x", &["c:A::get"], &["c:A::get"]));
+        let index = Index::build(&[file("a.php", vec![get, run])]);
+
+        let traces = index.traces("name_en");
+        assert_eq!(traces.len(), 1, "{traces:#?}");
+        assert!(traces[0].must);
+    }
+
+    /// Возврат метода только may: `must` не наследуется.
+    #[test]
+    fn must_is_false_when_the_callee_return_is_may_only() {
+        let mut get = method("A::get");
+        get.returns
+            .push(read(3, "$row['name_en']", &["key:name_en"]));
+        let mut run = method("A::run");
+        run.reads
+            .push(read_must(9, "$x", &["c:A::get"], &["c:A::get"]));
+        let index = Index::build(&[file("a.php", vec![get, run])]);
+
+        let traces = index.traces("name_en");
+        assert_eq!(traces.len(), 1, "{traces:#?}");
+        assert!(!traces[0].must);
+    }
+
+    /// `must` проходит через гарантированный аргумент своего call-site.
+    #[test]
+    fn must_through_a_must_argument() {
+        let mut id = method("A::id");
+        id.params = 1;
+        id.returns
+            .push(read_must(2, "$v", &["p:A::id#0"], &["p:A::id#0"]));
+        let mut run = method("A::run");
+        run.args
+            .push(arg_must(10, "A::id", 0, &["key:id"], &["key:id"]));
+        run.reads
+            .push(read_must(10, "$x", &["c:A::id@10"], &["c:A::id@10"]));
+        let index = Index::build(&[file("a.php", vec![id, run])]);
+
+        let traces = index.traces("id");
+        assert_eq!(traces.len(), 1, "{traces:#?}");
+        assert!(traces[0].must);
     }
 }

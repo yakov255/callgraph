@@ -17,8 +17,8 @@ use super::uses_args::{parse_deps, parse_uses};
 
 fn usage() -> &'static str {
     crate::t!(
-        "callgraph [--lang <id,...>] [--cache <file>] [--no-cache] <file|dir> [...] | callgraph prune [--cache <file>] [--dry-run] | callgraph set-lang [en|hu] | callgraph self-update [--check] | callgraph note add|list|rm … | callgraph refresh [--project <alias|dir>] [--background] [<path>…] | callgraph locate <term>... [--all] [--project <alias|dir>] | callgraph hook install|uninstall|status | callgraph stats [--events] [--days N] | callgraph flow map [--project <alias|dir>] [--json] [--table <name>] [--full] | callgraph trace <term>... [--project <alias|dir>] [--json] [--full] | callgraph mcp [--auto-update] | callgraph --version  (any command: --no-gitignore = ignore the .gitignore files)",
-        "callgraph [--lang <id,...>] [--cache <fájl>] [--no-cache] <fájl|mappa> [...] | callgraph prune [--cache <fájl>] [--dry-run] | callgraph set-lang [en|hu] | callgraph self-update [--check] | callgraph note add|list|rm … | callgraph refresh [--project <alias|mappa>] [--background] [<út>…] | callgraph locate <kifejezés>... [--all] [--project <alias|mappa>] | callgraph hook install|uninstall|status | callgraph stats [--events] [--days N] | callgraph flow map [--project <alias|mappa>] [--json] [--table <név>] [--full] | callgraph trace <kifejezés>... [--project <alias|mappa>] [--json] [--full] | callgraph mcp [--auto-update] | callgraph --version  (bármely parancsnál: --no-gitignore = a .gitignore fájlok nélkül)"
+        "callgraph [--lang <id,...>] [--cache <file>] [--no-cache] <file|dir> [...] | callgraph prune [--cache <file>] [--dry-run] | callgraph set-lang [en|hu] | callgraph self-update [--check] | callgraph note add|list|rm … | callgraph refresh [--project <alias|dir>] [--background] [<path>…] | callgraph locate <term>... [--all] [--project <alias|dir>] | callgraph hook install|uninstall|status | callgraph stats [--events] [--days N] | callgraph flow map [--project <alias|dir>] [--json] [--table <name>] [--full] | callgraph trace <term>... [--project <alias|dir>] [--json] [--full] [--must] | callgraph mcp [--auto-update] | callgraph --version  (any command: --no-gitignore = ignore the .gitignore files)",
+        "callgraph [--lang <id,...>] [--cache <fájl>] [--no-cache] <fájl|mappa> [...] | callgraph prune [--cache <fájl>] [--dry-run] | callgraph set-lang [en|hu] | callgraph self-update [--check] | callgraph note add|list|rm … | callgraph refresh [--project <alias|mappa>] [--background] [<út>…] | callgraph locate <kifejezés>... [--all] [--project <alias|mappa>] | callgraph hook install|uninstall|status | callgraph stats [--events] [--days N] | callgraph flow map [--project <alias|mappa>] [--json] [--table <név>] [--full] | callgraph trace <kifejezés>... [--project <alias|mappa>] [--json] [--full] [--must] | callgraph mcp [--auto-update] | callgraph --version  (bármely parancsnál: --no-gitignore = a .gitignore fájlok nélkül)"
     )
 }
 
@@ -59,8 +59,8 @@ fn refresh_usage() -> &'static str {
 
 fn trace_usage() -> &'static str {
     crate::t!(
-        "callgraph trace <term>... [--project <alias|dir>] [--json] [--full]  (data flow: where a DB column / array key / property is read)",
-        "callgraph trace <kifejezés>... [--project <alias|mappa>] [--json] [--full]  (adatfolyam: hol olvassák a DB-oszlopot / tömbkulcsot / property-t)"
+        "callgraph trace <term>... [--project <alias|dir>] [--json] [--full] [--must]  (data flow: where a DB column / array key / property is read; --must: every path)",
+        "callgraph trace <kifejezés>... [--project <alias|mappa>] [--json] [--full] [--must]  (adatfolyam: hol olvassák a DB-oszlopot / tömbkulcsot / property-t; --must: minden úton)"
     )
 }
 
@@ -263,6 +263,7 @@ pub enum CliArgs {
         project: Option<String>,
         json: bool,
         full: bool,
+        must: bool,
     },
     Version,
     /// `--help` / `-h` / `help`: a teljes súgó.
@@ -682,6 +683,7 @@ impl CliArgs {
         let mut project = None;
         let mut json = false;
         let mut full = false;
+        let mut must = false;
         let mut i = 0;
         while i < args.len() {
             match args[i].as_str() {
@@ -691,6 +693,7 @@ impl CliArgs {
                 }
                 "--json" => json = true,
                 "--full" => full = true,
+                "--must" => must = true,
                 "--project" if i + 1 < args.len() => {
                     project = Some(args[i + 1].clone());
                     i += 1;
@@ -709,6 +712,7 @@ impl CliArgs {
             project,
             json,
             full,
+            must,
         })
     }
 

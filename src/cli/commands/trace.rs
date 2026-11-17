@@ -21,6 +21,7 @@ pub struct TraceCommand {
     project: Option<String>,
     json: bool,
     full: bool,
+    must_only: bool,
     home: SkillHome,
 }
 
@@ -37,8 +38,15 @@ impl TraceCommand {
             project,
             json,
             full,
+            must_only: false,
             home,
         }
+    }
+
+    /// `--must`: только чтения, где колонка доходит на каждом пути.
+    pub fn must_only(mut self, on: bool) -> Self {
+        self.must_only = on;
+        self
     }
 }
 
@@ -51,7 +59,13 @@ impl Command for TraceCommand {
         let groups: Vec<(String, Vec<Trace>)> = self
             .terms
             .iter()
-            .map(|term| (term.clone(), index.traces(term)))
+            .map(|term| {
+                let mut traces = index.traces(term);
+                if self.must_only {
+                    traces.retain(|trace| trace.must);
+                }
+                (term.clone(), traces)
+            })
             .collect();
         if self.json {
             writeln!(out, "{}", render_json(&root, &groups, self.full)?)?;
@@ -87,12 +101,22 @@ fn render_text(
             continue;
         }
         let files: BTreeSet<&str> = traces.iter().map(|t| t.file.as_str()).collect();
-        let _ = writeln!(
-            text,
-            "trace: {term} · {} reads in {} files",
-            traces.len(),
-            files.len()
-        );
+        let must = traces.iter().filter(|t| t.must).count();
+        if must > 0 {
+            let _ = writeln!(
+                text,
+                "trace: {term} · {} reads in {} files · {must} must",
+                traces.len(),
+                files.len()
+            );
+        } else {
+            let _ = writeln!(
+                text,
+                "trace: {term} · {} reads in {} files",
+                traces.len(),
+                files.len()
+            );
+        }
         for trace in traces {
             if !full && shown >= LIMIT {
                 let _ = writeln!(text, "… more (--full)");
@@ -100,10 +124,11 @@ fn render_text(
             }
             let _ = writeln!(
                 text,
-                "{}  {}  L{}",
+                "{}  {}  L{}{}",
                 relative(root, &trace.file),
                 trace.method,
-                trace.line
+                trace.line,
+                if trace.must { "  [must]" } else { "" }
             );
             let _ = writeln!(text, "  {}", trace.expr);
             let _ = writeln!(text, "  {}", trace.chain.join(" → "));
@@ -123,6 +148,7 @@ fn render_json(root: &Path, groups: &[(String, Vec<Trace>)], full: bool) -> Resu
             }
             items.push(serde_json::json!({
                 "term": term,
+                "must": trace.must,
                 "column": trace.column,
                 "file": relative(root, &trace.file),
                 "method": trace.method,
@@ -142,6 +168,7 @@ mod tests {
     fn trace(file: &str, method: &str, line: u32, expr: &str, chain: &[&str]) -> Trace {
         Trace {
             column: "service_type".into(),
+            must: false,
             chain: chain.iter().map(|s| s.to_string()).collect(),
             file: file.into(),
             method: method.into(),
@@ -192,6 +219,31 @@ mod tests {
         );
         let text = render_text(root, &terms, &groups, false);
         assert!(text.contains("/other/x.php  f  L1\n"));
+    }
+
+    #[test]
+    fn may_trace_has_no_must_suffix() {
+        let root = Path::new("/project");
+        let (terms, groups) = one(
+            "service_type",
+            vec![trace("/project/src/a.php", "f", 64, "$x", &["lit"])],
+        );
+        let text = render_text(root, &terms, &groups, false);
+        assert!(text.contains("src/a.php  f  L64\n"));
+        assert!(!text.contains("[must]"));
+    }
+
+    #[test]
+    fn must_trace_is_marked_in_text_and_json() {
+        let root = Path::new("/project");
+        let mut item = trace("/project/src/a.php", "f", 64, "$x", &["lit"]);
+        item.must = true;
+        let (terms, groups) = one("service_type", vec![item]);
+        let text = render_text(root, &terms, &groups, false);
+        assert!(text.contains("src/a.php  f  L64  [must]\n"));
+        assert!(text.contains("trace: service_type · 1 reads in 1 files · 1 must\n"));
+        let json = render_json(root, &groups, false).unwrap();
+        assert!(json.contains("\"must\": true"));
     }
 
     #[test]

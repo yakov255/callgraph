@@ -17,6 +17,10 @@ use crate::lang::php::printer::lossy;
 
 /// Максимум атомов в одном наборе истоков.
 const MAX_ATOMS: usize = 16;
+/// Максимум вложенных ветвлений, которые анализ различает по путям.
+const MAX_DEPTH: u32 = 4;
+/// Максимум одновременных живых путей.
+const MAX_PATHS: usize = 32;
 /// Идентификатор кода верхнего уровня.
 const TOP: &str = "__top__";
 
@@ -323,6 +327,23 @@ impl<'a> ReturnCollector<'_, 'a> {
 // Анализ тела метода.
 // ---------------------------------------------------------------------------
 
+/// Состояние анализа: достижимые значения и факты о текущем пути.
+#[derive(Debug, Clone, Default)]
+struct FlowState {
+    /// Истоки переменных (may): `$x` -> атомы.
+    vars: HashMap<String, Vec<String>>,
+    /// Гарантированные истоки переменных (must): `$x` -> атомы, подмножество `vars`.
+    must: HashMap<String, Vec<String>>,
+    /// Минимальные типы: `$x` / `this->p` -> полное имя класса.
+    types: HashMap<String, String>,
+    /// Известные булевы значения: `$flag` -> `true`/`false`.
+    bools: HashMap<String, bool>,
+    /// Переменные, гарантированно равные `null`.
+    nulls: HashSet<String>,
+    /// Путь завершён (`return`): до конца блока записи не идут.
+    terminated: bool,
+}
+
 struct Analyzer<'p, 'a, 't> {
     parsed: &'p ParsedFile<'a>,
     resolver: NameResolver,
@@ -330,10 +351,12 @@ struct Analyzer<'p, 'a, 't> {
     class: Option<String>,
     /// `Class::method`, имя функции или `__top__`.
     method: String,
-    /// Истоки переменных: `$x` -> атомы.
-    vars: HashMap<String, Vec<String>>,
-    /// Минимальные типы: `$x` / `this->p` -> полное имя класса.
-    types: HashMap<String, String>,
+    /// Текущее состояние пути.
+    state: FlowState,
+    /// Глубина вложенных ветвлений (кап `MAX_DEPTH`).
+    depth: u32,
+    /// Число живых путей (кап `MAX_PATHS`).
+    paths: usize,
     /// Типы возврата методов проекта (`Class::method` -> класс).
     method_types: &'t MethodTypes,
     flow: MethodFlow,
@@ -358,14 +381,21 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
             },
             class,
             method,
-            vars: HashMap::new(),
-            types,
+            state: FlowState {
+                types,
+                ..FlowState::default()
+            },
+            depth: 0,
+            paths: 0,
             method_types,
         }
     }
 
     fn statements(&mut self, statements: &[Statement<'a>]) {
         for statement in statements {
+            if self.state.terminated {
+                break;
+            }
             self.statement(statement);
         }
     }
@@ -373,29 +403,25 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
     fn statement(&mut self, statement: &Statement<'a>) {
         match statement {
             Statement::Block(block) => self.statements(block.statements.as_slice()),
-            Statement::If(node) => {
-                self.condition(node.condition);
-                self.statements(node.body.statements());
-                for (condition, body) in node.body.else_if_clauses() {
-                    self.condition(condition);
-                    self.statements(body);
-                }
-                if let Some(body) = node.body.else_statements() {
-                    self.statements(body);
-                }
-            }
+            Statement::If(node) => self.if_statement(node),
             Statement::While(node) => {
+                let before = self.state.clone();
                 self.condition(node.condition);
                 self.statements(node.body.statements());
+                self.loop_join(before);
             }
             Statement::DoWhile(node) => {
                 self.statement(node.statement);
+                if self.state.terminated {
+                    return;
+                }
                 self.condition(node.condition);
             }
             Statement::For(node) => {
                 for expression in node.initializations.iter() {
                     self.expression_statement(expression);
                 }
+                let before = self.state.clone();
                 for expression in node.conditions.iter() {
                     self.condition(expression);
                 }
@@ -403,29 +429,30 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
                     self.expression_statement(expression);
                 }
                 self.statements(node.body.statements());
+                self.loop_join(before);
             }
-            Statement::Foreach(node) => self.foreach(node),
-            Statement::Switch(node) => {
-                self.condition(node.expression);
-                for case in node.body.cases() {
-                    if let Some(expression) = case.expression() {
-                        self.expression_statement(expression);
-                    }
-                    self.statements(case.statements());
-                }
+            Statement::Foreach(node) => {
+                let before = self.state.clone();
+                self.foreach(node);
+                self.loop_join(before);
             }
+            Statement::Switch(node) => self.switch_statement(node),
             Statement::Return(node) => {
-                let Some(value) = node.value else {
-                    return;
-                };
-                let origins = self.origins(value);
-                if significant(&origins) {
-                    self.flow.returns.push(Read {
-                        line: self.line_of(value),
-                        expr: self.one_line(value),
-                        origins: norm(origins),
-                    });
+                if let Some(value) = node.value {
+                    let origins = self.origins(value);
+                    let must = self.origins_must(value);
+                    if significant(&origins) {
+                        let origins = norm(origins);
+                        let must = must_within(must, &origins);
+                        self.flow.returns.push(Read {
+                            line: self.line_of(value),
+                            expr: self.one_line(value),
+                            origins,
+                            must,
+                        });
+                    }
                 }
+                self.state.terminated = true;
             }
             Statement::Expression(node) => self.expression_statement(node.expression),
             Statement::Echo(node) => {
@@ -434,6 +461,158 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
                 }
             }
             _ => {}
+        }
+    }
+
+    // -- ветвления ----------------------------------------------------------
+
+    /// `if` / `elseif` / `else`: путь на ветку, слияние may/must на выходе.
+    fn if_statement(&mut self, node: &If<'a>) {
+        let mut branches: Vec<(&Expression<'a>, &[Statement<'a>])> =
+            vec![(node.condition, node.body.statements())];
+        for (condition, body) in node.body.else_if_clauses() {
+            branches.push((condition, body));
+        }
+        self.chain(&branches, node.body.else_statements());
+    }
+
+    /// Цепочка условий: первое выполнимое, иначе следующее, иначе `else`.
+    fn chain(
+        &mut self,
+        branches: &[(&Expression<'a>, &[Statement<'a>])],
+        otherwise: Option<&[Statement<'a>]>,
+    ) {
+        let Some((&(condition, body), rest)) = branches.split_first() else {
+            if let Some(otherwise) = otherwise {
+                self.statements(otherwise);
+            }
+            return;
+        };
+        self.condition(condition);
+        match self.decide(condition) {
+            // Статически известно значение: невыполнимые ветки не идут вовсе.
+            Some(true) => self.branch(body),
+            Some(false) => self.chain(rest, otherwise),
+            None if !self.can_fork() => {
+                let before = self.state.clone();
+                self.branch(body);
+                self.chain(rest, otherwise);
+                self.conservative_after(&before);
+            }
+            None => {
+                let snapshot = self.state.clone();
+                self.branch(body);
+                let then_state = self.state.clone();
+                self.state = snapshot;
+                self.chain(rest, otherwise);
+                let else_state = self.state.clone();
+                self.state = merge_states(then_state, else_state);
+            }
+        }
+    }
+
+    /// Одна ветка: учитывает кап вложенности и живых путей.
+    fn branch(&mut self, statements: &[Statement<'a>]) {
+        self.depth += 1;
+        self.paths += 1;
+        self.statements(statements);
+        self.paths -= 1;
+        self.depth -= 1;
+    }
+
+    fn can_fork(&self) -> bool {
+        self.depth < MAX_DEPTH && self.paths < MAX_PATHS
+    }
+
+    /// Слияние тела цикла с путём «ноль итераций»: may union, must intersection.
+    fn loop_join(&mut self, before: FlowState) {
+        let after = self.state.clone();
+        self.state = merge_states(before, after);
+    }
+
+    /// `switch`: все ветки в одном состоянии, must — пересечение по веткам.
+    fn switch_statement(&mut self, node: &Switch<'a>) {
+        self.condition(node.expression);
+        let before = self.state.clone();
+        let has_default = node.body.has_default_case();
+        let mut merged: Option<FlowState> = None;
+        for case in node.body.cases() {
+            self.state = before.clone();
+            if let Some(expression) = case.expression() {
+                self.expression_statement(expression);
+            }
+            self.statements(case.statements());
+            let arm = self.state.clone();
+            merged = Some(match merged {
+                Some(previous) => merge_states(previous, arm),
+                None => arm,
+            });
+        }
+        let merged = match merged {
+            Some(merged) if has_default => merged,
+            // Без `default` возможен путь «ни одна ветка не сработала».
+            Some(merged) => merge_states(merged, before),
+            None => before,
+        };
+        self.state = merged;
+    }
+
+    /// Статически известное значение условия, если его можно решить.
+    fn decide(&self, expression: &Expression<'a>) -> Option<bool> {
+        match expression.unparenthesized() {
+            Expression::Literal(Literal::True(_)) => Some(true),
+            Expression::Literal(Literal::False(_)) => Some(false),
+            Expression::Variable(Variable::Direct(variable)) => {
+                self.state.bools.get(&lossy(variable.name)).copied()
+            }
+            Expression::UnaryPrefix(unary)
+                if matches!(unary.operator, UnaryPrefixOperator::Not(_)) =>
+            {
+                self.decide(unary.operand).map(|value| !value)
+            }
+            Expression::Parenthesized(inner) => self.decide(inner.expression),
+            Expression::Binary(binary) => match binary.operator {
+                BinaryOperator::Identical(_) => self.null_test(binary.lhs, binary.rhs),
+                BinaryOperator::NotIdentical(_) => {
+                    self.null_test(binary.lhs, binary.rhs).map(|value| !value)
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// `$x === null`, где `$x` уже известен как `null` на текущем пути.
+    fn null_test(&self, lhs: &Expression<'a>, rhs: &Expression<'a>) -> Option<bool> {
+        let name = if is_null_literal(rhs) {
+            direct_var_name(lhs)
+        } else if is_null_literal(lhs) {
+            direct_var_name(rhs)
+        } else {
+            None
+        }?;
+        self.state.nulls.contains(&name).then_some(true)
+    }
+
+    /// Переполнение капов: ветки уже пройдены последовательно, must сброшен
+    /// для переменных, которые они присваивают.
+    fn conservative_after(&mut self, before: &FlowState) {
+        self.state
+            .bools
+            .retain(|name, value| before.bools.get(name) == Some(value));
+        self.state.nulls.retain(|name| before.nulls.contains(name));
+        self.state
+            .types
+            .retain(|name, ty| before.types.get(name) == Some(ty));
+        let changed: Vec<String> = self
+            .state
+            .vars
+            .iter()
+            .filter(|(name, origins)| before.vars.get(*name) != Some(*origins))
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in changed {
+            self.state.must.remove(&name);
         }
     }
 
@@ -456,30 +635,35 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
     }
 
     fn condition(&mut self, expression: &Expression<'a>) {
+        let must = self.origins_must(expression);
         let origins = self.origins(expression);
         let expr = self.one_line(expression);
         if significant(&origins) {
+            let origins = norm(origins);
+            let must = must_within(must, &origins);
             self.flow.reads.push(Read {
                 line: self.line_of(expression),
                 expr,
-                origins: norm(origins),
+                origins,
+                must,
             });
         }
     }
 
     fn foreach(&mut self, node: &Foreach<'a>) {
         let iterable = self.origins(node.expression);
+        let iterable_must = self.origins_must(node.expression);
         let element = self.type_of(node.expression);
         if let Some(name) = direct_var_name(node.target.value()) {
-            self.set_var(&name, &iterable);
+            self.set_var(&name, &iterable, &iterable_must);
             if let Some(element) = element {
-                self.types.insert(name, element);
+                self.state.types.insert(name, element);
             }
         }
         if let Some(key) = node.target.key()
             && let Some(name) = direct_var_name(key)
         {
-            self.set_var(&name, &["unknown".to_string()]);
+            self.set_var(&name, &["unknown".to_string()], &[]);
         }
         self.statements(node.body.statements());
     }
@@ -492,14 +676,16 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
             return Vec::new();
         }
         let origins = self.origins(node.rhs);
+        let must = self.origins_must(node.rhs);
         let line = self.line_of(node);
         let ty = self.value_type(node.rhs);
         match node.lhs.unparenthesized() {
             Expression::Variable(Variable::Direct(variable)) => {
                 let name = lossy(variable.name);
-                self.set_var(&name, &origins);
+                self.set_var(&name, &origins, &must);
+                self.facts(&name, node.rhs);
                 if let Some(ty) = ty {
-                    self.types.insert(name.clone(), ty);
+                    self.state.types.insert(name.clone(), ty);
                 }
                 self.flow.assigns.push(Assign {
                     line,
@@ -514,9 +700,9 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
                 let name = lossy(property.value);
                 if is_this(access.object) {
                     if self.class.is_some() {
-                        self.set_var(&format!("this->{name}"), &origins);
+                        self.set_var(&format!("this->{name}"), &origins, &must);
                         if let Some(ty) = ty {
-                            self.types.insert(format!("this->{name}"), ty);
+                            self.state.types.insert(format!("this->{name}"), ty);
                         }
                         self.flow.assigns.push(Assign {
                             line,
@@ -536,7 +722,8 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
                 let Some(base) = direct_var_name(access.array) else {
                     return origins;
                 };
-                self.set_var(&base, &origins);
+                // Запись в элемент: значение всего массива не гарантировано.
+                self.set_var(&base, &origins, &[]);
                 if let Some((_, text)) = self.literal_key(access.index) {
                     self.flow.assigns.push(Assign {
                         line,
@@ -549,7 +736,7 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
                 let Some(base) = direct_var_name(append.array) else {
                     return origins;
                 };
-                self.set_var(&base, &origins);
+                self.set_var(&base, &origins, &[]);
                 self.flow.assigns.push(Assign {
                     line,
                     lhs: format!("{base}[]"),
@@ -563,12 +750,13 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
 
     // -- выражения ----------------------------------------------------------
 
-    /// Истоки значения выражения; попутно пишет чтения и рёбра аргументов.
+    /// Истоки значения выражения (may); попутно пишет чтения и рёбра аргументов.
     fn origins(&mut self, expression: &Expression<'a>) -> Vec<String> {
         match expression.unparenthesized() {
             Expression::Variable(Variable::Direct(variable)) => {
                 let name = lossy(variable.name);
-                self.vars
+                self.state
+                    .vars
                     .get(&name)
                     .cloned()
                     .unwrap_or_else(|| vec!["unknown".into()])
@@ -581,7 +769,7 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
                     .property_atom(access.object, &access.property)
                     .map(|atom| vec![atom])
                     .unwrap_or_else(|| vec!["unknown".into()]);
-                self.record_read(expression, origins.clone());
+                self.record_read(expression, origins.clone(), origins.clone());
                 origins
             }
             Expression::Access(Access::NullSafeProperty(access)) => {
@@ -590,7 +778,7 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
                     .property_atom(access.object, &access.property)
                     .map(|atom| vec![atom])
                     .unwrap_or_else(|| vec!["unknown".into()]);
-                self.record_read(expression, origins.clone());
+                self.record_read(expression, origins.clone(), origins.clone());
                 origins
             }
             Expression::Access(Access::StaticProperty(_)) => vec!["unknown".into()],
@@ -598,15 +786,21 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
             Expression::ArrayAccess(access) => {
                 let mut origins = self.origins(access.array);
                 let key = self.literal_key(access.index);
+                let mut must = self.origins_must(access.array);
                 match &key {
-                    Some((name, _)) => origins.push(format!("key:{name}")),
-                    None => origins.extend(self.origins(access.index)),
+                    Some((name, _)) => {
+                        origins.push(format!("key:{name}"));
+                        must.push(format!("key:{name}"));
+                    }
+                    None => {
+                        origins.extend(self.origins(access.index));
+                        must.extend(self.origins_must(access.index));
+                    }
                 }
-                let origins = norm(origins);
                 if key.is_some() {
-                    self.record_read(expression, origins.clone());
+                    self.record_read(expression, origins.clone(), must.clone());
                 }
-                origins
+                norm(origins)
             }
             Expression::ArrayAppend(access) => self.origins(access.array),
             Expression::Call(call) => self.call(call, true),
@@ -621,8 +815,9 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
             Expression::UnaryPostfix(unary) => self.origins(unary.operand),
             Expression::Parenthesized(inner) => self.origins(inner.expression),
             Expression::Conditional(conditional) => {
+                let condition_must = self.origins_must(conditional.condition);
                 let condition = self.origins(conditional.condition);
-                self.record_read(conditional.condition, condition.clone());
+                self.record_read(conditional.condition, condition.clone(), condition_must);
                 let mut origins = condition;
                 if let Some(then) = conditional.then {
                     origins.extend(self.origins(then));
@@ -632,6 +827,19 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
             }
             Expression::Match(node) => {
                 self.condition(node.expression);
+                for arm in node.arms.iter() {
+                    match arm {
+                        MatchArm::Expression(arm) => {
+                            for condition in arm.conditions.iter() {
+                                self.origins(condition);
+                            }
+                            self.origins(arm.expression);
+                        }
+                        MatchArm::Default(arm) => {
+                            self.origins(arm.expression);
+                        }
+                    }
+                }
                 vec!["unknown".into()]
             }
             Expression::Construct(_) => vec!["unknown".into()],
@@ -640,20 +848,78 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
                 vec!["lit".into()]
             }
             Expression::Closure(closure) => {
-                let before = self.vars.clone();
+                let before = self.state.clone();
                 self.closure_params(&closure.parameter_list);
                 self.statements(closure.body.statements.as_slice());
                 self.merge_closure(before);
                 vec!["unknown".into()]
             }
             Expression::ArrowFunction(function) => {
-                let before = self.vars.clone();
+                let before = self.state.clone();
                 self.closure_params(&function.parameter_list);
                 self.origins(function.expression);
                 self.merge_closure(before);
                 vec!["unknown".into()]
             }
             _ => vec!["unknown".into()],
+        }
+    }
+
+    /// Истоки значения выражения (must); без записи чтений и рёбер.
+    fn origins_must(&self, expression: &Expression<'a>) -> Vec<String> {
+        match expression.unparenthesized() {
+            Expression::Variable(Variable::Direct(variable)) => self
+                .state
+                .must
+                .get(&lossy(variable.name))
+                .cloned()
+                .unwrap_or_default(),
+            Expression::Variable(_) => Vec::new(),
+            Expression::Literal(_) | Expression::Identifier(_) => vec!["lit".into()],
+            Expression::Access(Access::Property(access)) => self
+                .property_atom(access.object, &access.property)
+                .map(|atom| vec![atom])
+                .unwrap_or_default(),
+            Expression::Access(Access::NullSafeProperty(access)) => self
+                .property_atom(access.object, &access.property)
+                .map(|atom| vec![atom])
+                .unwrap_or_default(),
+            Expression::Access(Access::StaticProperty(_)) => Vec::new(),
+            Expression::Access(_) => vec!["lit".into()],
+            Expression::ArrayAccess(access) => {
+                let mut must = self.origins_must(access.array);
+                match self.literal_key(access.index) {
+                    Some((name, _)) => must.push(format!("key:{name}")),
+                    None => must.extend(self.origins_must(access.index)),
+                }
+                norm(must)
+            }
+            Expression::ArrayAppend(access) => self.origins_must(access.array),
+            Expression::Call(call) => self
+                .call_target(call)
+                .map(|target| vec![format!("c:{target}@{}", self.line_of(call))])
+                .unwrap_or_default(),
+            Expression::Instantiation(node) => self
+                .class_name(node.class)
+                .map(|class| vec![format!("new:{class}@{}", self.line_of(node))])
+                .unwrap_or_default(),
+            Expression::Binary(binary) => {
+                let left = self.origins_must(binary.lhs);
+                let right = self.origins_must(binary.rhs);
+                intersect(&left, &right)
+            }
+            Expression::UnaryPrefix(unary) => self.origins_must(unary.operand),
+            Expression::UnaryPostfix(unary) => self.origins_must(unary.operand),
+            Expression::Parenthesized(inner) => self.origins_must(inner.expression),
+            Expression::Conditional(conditional) => {
+                let then = match conditional.then {
+                    Some(then) => self.origins_must(then),
+                    None => self.origins_must(conditional.condition),
+                };
+                let otherwise = self.origins_must(conditional.r#else);
+                intersect(&then, &otherwise)
+            }
+            _ => Vec::new(),
         }
     }
 
@@ -691,7 +957,7 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
             Some(target) => {
                 let origins = vec![format!("c:{target}@{line}")];
                 if used {
-                    self.record_read(call, origins.clone());
+                    self.record_read(call, origins.clone(), origins.clone());
                 }
                 origins
             }
@@ -721,11 +987,13 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
                 continue;
             };
             let origins = self.origins(argument.value);
+            let must = self.origins_must(argument.value);
             self.flow.args.push(ArgEdge {
                 line,
                 target: target.to_string(),
                 index,
                 origins: norm(origins),
+                must: norm(must),
             });
         }
     }
@@ -792,13 +1060,14 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
     fn type_of(&self, expression: &Expression<'a>) -> Option<String> {
         match expression.unparenthesized() {
             Expression::Variable(Variable::Direct(variable)) => {
-                self.types.get(&lossy(variable.name)).cloned()
+                self.state.types.get(&lossy(variable.name)).cloned()
             }
             Expression::Access(Access::Property(access)) if is_this(access.object) => {
                 let ClassLikeMemberSelector::Identifier(property) = &access.property else {
                     return None;
                 };
-                self.types
+                self.state
+                    .types
                     .get(&format!("this->{}", lossy(property.value)))
                     .cloned()
             }
@@ -860,13 +1129,14 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
         for (index, parameter) in list.parameters.iter().enumerate() {
             let name = lossy(parameter.variable.name);
             let atom = format!("p:{}#{index}", self.method);
-            self.vars.insert(name.clone(), vec![atom.clone()]);
+            self.state.vars.insert(name.clone(), vec![atom.clone()]);
+            self.state.must.insert(name.clone(), vec![atom.clone()]);
             let ty = parameter
                 .hint
                 .as_ref()
                 .and_then(|hint| hint_type(self.parsed, &self.resolver, hint));
             if let Some(ty) = &ty {
-                self.types.insert(name.clone(), ty.clone());
+                self.state.types.insert(name.clone(), ty.clone());
             }
             if parameter.is_promoted_property() && self.class.is_some() {
                 let property = name.trim_start_matches('$');
@@ -876,7 +1146,7 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
                     origins: vec![atom],
                 });
                 if let Some(ty) = ty {
-                    self.types.insert(format!("this->{property}"), ty);
+                    self.state.types.insert(format!("this->{property}"), ty);
                 }
             }
         }
@@ -885,38 +1155,84 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
     /// Параметры замыкания: отдельных `p:`-атомов у них нет.
     fn closure_params(&mut self, list: &FunctionLikeParameterList<'a>) {
         for parameter in list.parameters.iter() {
-            self.vars
-                .insert(lossy(parameter.variable.name), vec!["unknown".into()]);
+            let name = lossy(parameter.variable.name);
+            self.state.vars.insert(name.clone(), vec!["unknown".into()]);
+            self.state.must.remove(&name);
+            self.state.bools.remove(&name);
+            self.state.nulls.remove(&name);
         }
     }
 
-    /// Слияние состояния после замыкания: внешние переменные объединяются.
-    fn merge_closure(&mut self, before: HashMap<String, Vec<String>>) {
-        for (name, origins) in before {
-            let merged = match self.vars.get(&name) {
-                Some(current) => union(current, &origins),
-                None => origins,
+    /// Слияние состояния после замыкания: замыкание может не выполниться,
+    /// поэтому must — только то, что было до него.
+    fn merge_closure(&mut self, before: FlowState) {
+        for (name, origins) in before.vars.iter() {
+            let merged = match self.state.vars.get(name) {
+                Some(current) => union(current, origins),
+                None => origins.clone(),
             };
-            self.vars.insert(name, merged);
+            self.state.vars.insert(name.clone(), merged);
+            match before.must.get(name) {
+                Some(before_must) => {
+                    let current = self.state.must.get(name).cloned().unwrap_or_default();
+                    let common = intersect(&current, before_must);
+                    if common.is_empty() {
+                        self.state.must.remove(name);
+                    } else {
+                        self.state.must.insert(name.clone(), common);
+                    }
+                }
+                None => {
+                    self.state.must.remove(name);
+                }
+            }
         }
     }
 
-    fn set_var(&mut self, name: &str, origins: &[String]) {
-        let merged = match self.vars.get(name) {
+    /// Установить значение переменной: may — union, must — сильное обновление.
+    fn set_var(&mut self, name: &str, origins: &[String], must: &[String]) {
+        let merged = match self.state.vars.get(name) {
             Some(current) => union(current, origins),
             None => norm(origins.to_vec()),
         };
-        self.vars.insert(name.to_string(), merged);
+        self.state.vars.insert(name.to_string(), merged);
+        let must = norm(must.to_vec());
+        if must.is_empty() {
+            self.state.must.remove(name);
+        } else {
+            self.state.must.insert(name.to_string(), must);
+        }
     }
 
-    fn record_read(&mut self, node: &impl HasSpan, origins: Vec<String>) {
+    /// Булевы/`null`-факты после присваивания.
+    fn facts(&mut self, name: &str, rhs: &Expression<'a>) {
+        self.state.bools.remove(name);
+        self.state.nulls.remove(name);
+        match rhs.unparenthesized() {
+            Expression::Literal(Literal::True(_)) => {
+                self.state.bools.insert(name.to_string(), true);
+            }
+            Expression::Literal(Literal::False(_)) => {
+                self.state.bools.insert(name.to_string(), false);
+            }
+            Expression::Literal(Literal::Null(_)) => {
+                self.state.nulls.insert(name.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    fn record_read(&mut self, node: &impl HasSpan, origins: Vec<String>, must: Vec<String>) {
         if !significant(&origins) {
             return;
         }
+        let origins = norm(origins);
+        let must = must_within(must, &origins);
         self.flow.reads.push(Read {
             line: self.parsed.lines_of(node).0,
             expr: self.one_line(node),
-            origins: norm(origins),
+            origins,
+            must,
         });
     }
 
@@ -1003,6 +1319,91 @@ fn union(left: &[String], right: &[String]) -> Vec<String> {
     let mut origins = left.to_vec();
     origins.extend_from_slice(right);
     norm(origins)
+}
+
+/// Пересечение множеств с сохранением порядка левого и капом `MAX_ATOMS`.
+fn intersect(left: &[String], right: &[String]) -> Vec<String> {
+    let right: HashSet<&String> = right.iter().collect();
+    let common: Vec<String> = left
+        .iter()
+        .filter(|atom| right.contains(atom))
+        .cloned()
+        .collect();
+    norm(common)
+}
+
+/// Оставить в `must` только атомы из `origins` (инвариант `must ⊆ origins`).
+fn must_within(must: Vec<String>, origins: &[String]) -> Vec<String> {
+    let accepted: HashSet<&String> = origins.iter().collect();
+    let kept: Vec<String> = must
+        .into_iter()
+        .filter(|atom| accepted.contains(atom))
+        .collect();
+    norm(kept)
+}
+
+/// Слияние двух достижимых состояний: may — union, must — intersection.
+fn merge_states(left: FlowState, right: FlowState) -> FlowState {
+    if left.terminated && right.terminated {
+        return FlowState {
+            terminated: true,
+            ..left
+        };
+    }
+    if left.terminated {
+        return right;
+    }
+    if right.terminated {
+        return left;
+    }
+    let mut vars = left.vars.clone();
+    for (name, origins) in &right.vars {
+        match vars.get_mut(name) {
+            Some(current) => *current = union(current, origins),
+            None => {
+                vars.insert(name.clone(), origins.clone());
+            }
+        }
+    }
+    let mut must = HashMap::new();
+    for (name, left_must) in &left.must {
+        let Some(right_must) = right.must.get(name) else {
+            continue;
+        };
+        let common = intersect(left_must, right_must);
+        if !common.is_empty() {
+            must.insert(name.clone(), common);
+        }
+    }
+    let mut bools = HashMap::new();
+    for (name, value) in &left.bools {
+        if right.bools.get(name) == Some(value) {
+            bools.insert(name.clone(), *value);
+        }
+    }
+    let nulls = left.nulls.intersection(&right.nulls).cloned().collect();
+    let mut types = HashMap::new();
+    for (name, ty) in &left.types {
+        if right.types.get(name) == Some(ty) {
+            types.insert(name.clone(), ty.clone());
+        }
+    }
+    FlowState {
+        vars,
+        must,
+        types,
+        bools,
+        nulls,
+        terminated: false,
+    }
+}
+
+/// Литерал `null`.
+fn is_null_literal(expression: &Expression<'_>) -> bool {
+    matches!(
+        expression.unparenthesized(),
+        Expression::Literal(Literal::Null(_))
+    )
 }
 
 /// Применить `use`-импорты файла к резолверу.
@@ -1625,6 +2026,156 @@ class Repo
                 .any(|atom| atom.starts_with("c:Repo::makeEntity@"))),
             "{:?}",
             all.returns
+        );
+    }
+
+    #[test]
+    fn must_survives_a_side_branch() {
+        let source = r#"<?php
+class C
+{
+    public function run($row, $c): void
+    {
+        $x = $row['name_en'];
+        if ($c) {
+            $y = 1;
+        }
+        if ($x) {
+        }
+    }
+}
+"#;
+        let files = facts(source);
+        let run = method(&files, "C::run");
+        let read = run
+            .reads
+            .iter()
+            .find(|read| read.expr == "$x")
+            .expect("нет чтения $x");
+        assert!(
+            read.must.iter().any(|atom| atom == "key:name_en"),
+            "{:?}",
+            read.must
+        );
+    }
+
+    #[test]
+    fn must_drops_when_a_branch_reassigns() {
+        let source = r#"<?php
+class C
+{
+    public function run($row, $c): void
+    {
+        $x = $row['name_en'];
+        if ($c) {
+            $x = 'lit';
+        }
+        if ($x) {
+        }
+    }
+}
+"#;
+        let files = facts(source);
+        let run = method(&files, "C::run");
+        let read = run
+            .reads
+            .iter()
+            .find(|read| read.expr == "$x")
+            .expect("нет чтения $x");
+        assert!(
+            read.origins.iter().any(|atom| atom == "key:name_en"),
+            "{:?}",
+            read.origins
+        );
+        assert!(read.must.is_empty(), "{:?}", read.must);
+    }
+
+    #[test]
+    fn prunes_a_contradictory_branch() {
+        let source = r#"<?php
+class C
+{
+    public function run($row): void
+    {
+        $flag = false;
+        if ($flag) {
+            $x = $row['name_en'];
+        }
+        if ($flag) {
+            if ($x) {
+            }
+        }
+    }
+}
+"#;
+        let files = facts(source);
+        let run = method(&files, "C::run");
+        assert!(
+            run.reads.iter().all(|read| read.expr != "$x"),
+            "{:?}",
+            run.reads
+        );
+    }
+
+    #[test]
+    fn early_return_terminates_the_path() {
+        let source = r#"<?php
+class C
+{
+    public function run($row, $c): void
+    {
+        if ($c) {
+            return $row['name_en'];
+        }
+        $x = 'lit';
+        $x = $row['id'];
+        if ($x) {
+        }
+    }
+}
+"#;
+        let files = facts(source);
+        let run = method(&files, "C::run");
+        let read = run
+            .reads
+            .iter()
+            .find(|read| read.expr == "$x")
+            .expect("нет чтения $x");
+        assert!(
+            !read.origins.iter().any(|atom| atom == "key:name_en"),
+            "{:?}",
+            read.origins
+        );
+        let assign = run
+            .assigns
+            .iter()
+            .find(|assign| assign.lhs == "$x")
+            .expect("нет присваивания $x");
+        assert!(
+            !assign.origins.iter().any(|atom| atom == "key:name_en"),
+            "{:?}",
+            assign.origins
+        );
+    }
+
+    #[test]
+    fn must_on_return() {
+        let source = r#"<?php
+class C
+{
+    public function name($row)
+    {
+        return $row['name_en'];
+    }
+}
+"#;
+        let files = facts(source);
+        let name = method(&files, "C::name");
+        let ret = name.returns.first().expect("нет возврата");
+        assert!(
+            ret.must.iter().any(|atom| atom == "key:name_en"),
+            "{:?}",
+            ret.must
         );
     }
 

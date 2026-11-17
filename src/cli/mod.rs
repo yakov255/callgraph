@@ -106,13 +106,17 @@ pub fn build_command(args: CliArgs) -> Result<Box<dyn Command>> {
             project,
             json,
             full,
-        } => Ok(Box::new(commands::TraceCommand::new(
-            terms,
-            project,
-            json,
-            full,
-            crate::skill::SkillHome::from_env(),
-        ))),
+            must,
+        } => Ok(Box::new(
+            commands::TraceCommand::new(
+                terms,
+                project,
+                json,
+                full,
+                crate::skill::SkillHome::from_env(),
+            )
+            .must_only(must),
+        )),
         CliArgs::Flow {
             project,
             json,

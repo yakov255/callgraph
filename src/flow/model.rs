@@ -51,7 +51,11 @@ pub struct Assign {
 pub struct Read {
     pub line: u32,
     pub expr: String,
+    /// `may`: истоки, которые достигают чтения хотя бы на одном пути.
     pub origins: Vec<String>,
+    /// `must`: истоки, которые достигают чтения на каждом достижимом пути; `must ⊆ origins`.
+    /// Пусто — анализ не даёт гарантии (консервативно).
+    pub must: Vec<String>,
 }
 
 /// Получатель вызова метода: истоки объекта (для привязки `prop:this::` к месту создания).
@@ -69,6 +73,8 @@ pub struct ArgEdge {
     pub target: String,
     pub index: usize,
     pub origins: Vec<String>,
+    /// `must`-множество аргумента (см. `Read::must`).
+    pub must: Vec<String>,
 }
 
 /// Одна цепочка от источника до чтения.
@@ -76,6 +82,8 @@ pub struct ArgEdge {
 pub struct Trace {
     /// Совпавший ключ/колонка (`service_type`).
     pub column: String,
+    /// `true`: колонка доходит на каждом пути; `false`: только may.
+    pub must: bool,
     /// Цепочка атомов от источника к чтению.
     pub chain: Vec<String>,
     pub file: String,
