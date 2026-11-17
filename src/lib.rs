@@ -5,6 +5,7 @@ pub mod analysis;
 pub mod cli;
 pub mod core;
 pub mod error;
+pub mod flow;
 pub mod generate;
 pub mod graph;
 pub mod hook;

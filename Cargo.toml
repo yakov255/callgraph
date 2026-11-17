@@ -20,7 +20,7 @@ mago-syntax = "=1.59.0"
 mago-allocator = "=1.59.0"
 mago-database = "=1.59.0"
 mago-span = "=1.59.0"
-jsonc-parser = "=0.34.0"
+jsonc-parser = { version = "=0.34.0", features = ["serde"] }
 oxc_allocator = "=0.157.0"
 oxc_ast = "=0.157.0"
 oxc_syntax = "=0.157.0"

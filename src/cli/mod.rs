@@ -101,6 +101,18 @@ pub fn build_command(args: CliArgs) -> Result<Box<dyn Command>> {
             background,
             crate::skill::SkillHome::from_env(),
         ))),
+        CliArgs::Flow {
+            project,
+            json,
+            table,
+            full,
+        } => Ok(Box::new(commands::FlowCommand::new(
+            project,
+            json,
+            table,
+            full,
+            crate::skill::SkillHome::from_env(),
+        ))),
         CliArgs::Locate {
             terms,
             all,

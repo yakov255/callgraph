@@ -17,8 +17,8 @@ use super::uses_args::{parse_deps, parse_uses};
 
 fn usage() -> &'static str {
     crate::t!(
-        "callgraph [--lang <id,...>] [--cache <file>] [--no-cache] <file|dir> [...] | callgraph prune [--cache <file>] [--dry-run] | callgraph set-lang [en|hu] | callgraph self-update [--check] | callgraph note add|list|rm … | callgraph refresh [--project <alias|dir>] [--background] [<path>…] | callgraph locate <term>... [--all] [--project <alias|dir>] | callgraph hook install|uninstall|status | callgraph stats [--events] [--days N] | callgraph mcp [--auto-update] | callgraph --version  (any command: --no-gitignore = ignore the .gitignore files)",
-        "callgraph [--lang <id,...>] [--cache <fájl>] [--no-cache] <fájl|mappa> [...] | callgraph prune [--cache <fájl>] [--dry-run] | callgraph set-lang [en|hu] | callgraph self-update [--check] | callgraph note add|list|rm … | callgraph refresh [--project <alias|mappa>] [--background] [<út>…] | callgraph locate <kifejezés>... [--all] [--project <alias|mappa>] | callgraph hook install|uninstall|status | callgraph stats [--events] [--days N] | callgraph mcp [--auto-update] | callgraph --version  (bármely parancsnál: --no-gitignore = a .gitignore fájlok nélkül)"
+        "callgraph [--lang <id,...>] [--cache <file>] [--no-cache] <file|dir> [...] | callgraph prune [--cache <file>] [--dry-run] | callgraph set-lang [en|hu] | callgraph self-update [--check] | callgraph note add|list|rm … | callgraph refresh [--project <alias|dir>] [--background] [<path>…] | callgraph locate <term>... [--all] [--project <alias|dir>] | callgraph hook install|uninstall|status | callgraph stats [--events] [--days N] | callgraph flow map [--project <alias|dir>] [--json] [--table <name>] [--full] | callgraph mcp [--auto-update] | callgraph --version  (any command: --no-gitignore = ignore the .gitignore files)",
+        "callgraph [--lang <id,...>] [--cache <fájl>] [--no-cache] <fájl|mappa> [...] | callgraph prune [--cache <fájl>] [--dry-run] | callgraph set-lang [en|hu] | callgraph self-update [--check] | callgraph note add|list|rm … | callgraph refresh [--project <alias|mappa>] [--background] [<út>…] | callgraph locate <kifejezés>... [--all] [--project <alias|mappa>] | callgraph hook install|uninstall|status | callgraph stats [--events] [--days N] | callgraph flow map [--project <alias|mappa>] [--json] [--table <név>] [--full] | callgraph mcp [--auto-update] | callgraph --version  (bármely parancsnál: --no-gitignore = a .gitignore fájlok nélkül)"
     )
 }
 
@@ -54,6 +54,13 @@ fn refresh_usage() -> &'static str {
     crate::t!(
         "callgraph refresh [--project <alias|root>] [--background] [<file|dir> ...]  (no path: every changed / new / deleted file of the project)",
         "callgraph refresh [--project <alias|gyökér>] [--background] [<fájl|mappa> ...]  (út nélkül: a projekt minden változott / új / törölt fájlja)"
+    )
+}
+
+fn flow_usage() -> &'static str {
+    crate::t!(
+        "callgraph flow map [--project <alias|dir>] [--json] [--table <name>] [--full]  (table <-> property mapping from PHP classes and the .callgraph-flow.json handlers)",
+        "callgraph flow map [--project <alias|mappa>] [--json] [--table <név>] [--full]  (tábla <-> property megfeleltetés PHP-osztályokból és a .callgraph-flow.json handlereiből)"
     )
 }
 
@@ -206,7 +213,10 @@ pub enum CliArgs {
     },
     /// `stats [--events] [--days N]`: a helyi használati statisztika az elmúlt N napról (`crate::stats`);
     /// `--events`: a helyi eseménynapló és a leggyakoribb parancs-átmenetek.
-    Stats { days: u32, events: bool },
+    Stats {
+        days: u32,
+        events: bool,
+    },
     /// `next <rN> <k>[,<k>] [--project X]`: egy korábbi eredmény javasolt következő lépése (`crate::next`).
     Next {
         id: String,
@@ -229,15 +239,29 @@ pub enum CliArgs {
         project: Option<String>,
     },
     /// `telemetry on|off|status|preview`: a helyi statisztika opt-in beküldése (`crate::stats::telemetry`).
-    Telemetry { action: TelemetryAction },
+    Telemetry {
+        action: TelemetryAction,
+    },
     /// `--version` / `-V`: a verzió és a platform.
+    /// `flow map`: сопоставление таблица ↔ property из PHP-классов, с плагинами.
+    Flow {
+        project: Option<String>,
+        json: bool,
+        table: Option<String>,
+        full: bool,
+    },
     Version,
     /// `--help` / `-h` / `help`: a teljes súgó.
     Help,
     /// `mcp [--auto-update]`: MCP-szerver stdio-n; `--auto-update`: indításkor naponta egyszer frissít.
-    Mcp { auto_update: bool },
+    Mcp {
+        auto_update: bool,
+    },
     /// Skill-parancs (`project`, `feedback`, `wrap`, `error`, `set-lang`, `self-update`, `skill-sync`) nyers argumentumokkal.
-    Skill { command: String, args: Vec<String> },
+    Skill {
+        command: String,
+        args: Vec<String>,
+    },
 }
 
 impl CliArgs {
@@ -288,6 +312,10 @@ impl CliArgs {
         }
         if args.first().is_some_and(|a| a == "deps") {
             return parse_deps(&args[1..]);
+        }
+        if args.first().is_some_and(|a| a == "flow") {
+            return Self::parse_flow(&args[1..]);
+        }
         }
         if args.first().is_some_and(|a| a == "hook") {
             return Self::parse_hook(&args[1..]);
@@ -589,6 +617,47 @@ impl CliArgs {
 
     /// `locate <kifejezés>… [--all] [--project <alias|út>]`; `--` után minden kifejezés (a `-`-sel kezdődők is);
     /// egy ismeretlen `--…` argumentum is kifejezés (CSS-változó), az egy kötőjeles ismeretlen kapcsoló hiba.
+    /// `flow map [--project <alias|путь>] [--json] [--table <имя>] [--full]`.
+    fn parse_flow(args: &[String]) -> Result<Self> {
+        let usage = || CallgraphError::Usage(flow_usage().into());
+        let mut project = None;
+        let mut json = false;
+        let mut table = None;
+        let mut full = false;
+        let mut i = 0;
+        // необязательное слово `map`
+        if args.first().is_some_and(|a| a == "map") {
+            i = 1;
+        }
+        while i < args.len() {
+            match args[i].as_str() {
+                "--json" => json = true,
+                "--full" => full = true,
+                "--project" if i + 1 < args.len() => {
+                    project = Some(args[i + 1].clone());
+                    i += 1;
+                }
+                x if x.starts_with("--project=") => project = Some(x[10..].to_owned()),
+                "--table" if i + 1 < args.len() => {
+                    table = Some(args[i + 1].clone());
+                    i += 1;
+                }
+                x if x.starts_with("--table=") => table = Some(x[8..].to_owned()),
+                _ => return Err(usage()),
+            }
+            i += 1;
+        }
+        if project.as_deref().is_some_and(str::is_empty) {
+            return Err(usage());
+        }
+        Ok(Self::Flow {
+            project,
+            json,
+            table,
+            full,
+        })
+    }
+
     fn parse_locate(args: &[String]) -> Result<Self> {
         let usage = || CallgraphError::Usage(crate::locate::usage().into());
         let mut terms = Vec::new();

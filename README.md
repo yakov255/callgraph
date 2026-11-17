@@ -243,6 +243,7 @@ registering; without it, the current directory is the root.
 | Impact analysis | `callgraph.sh <dir> --grep <pattern> --depth N [--guess]` |
 | String literal / constant usages | `callgraph.sh <dir> --strings <pattern>` · `--const <pattern>` |
 | Filter by call category | `callgraph.sh <dir> --category model_use,orm_relation` |
+| DB table ↔ property map | `callgraph.sh flow map [--project <alias>] [--table <name>]` |
 
 ### Where to start: `locate`
 
@@ -500,7 +501,8 @@ files ─► FileWalker ─► LanguageRegistry ─► Language::analyze ─► 
 - Results are cached per file in JSONL (keyed by mtime); "who calls this?" uses an incremental project index (mtime + size) under
   `.callgraph/`.
 
-Design and coding rules: [`ARCHITECTURE.md`](ARCHITECTURE.md) · query layer: [`docs/QUERY.md`](docs/QUERY.md) ·
+Design and coding rules: [`ARCHITECTURE.md`](ARCHITECTURE.md) · DB ↔ code mapping and the flow plugins:
+[`docs/FLOW.md`](docs/FLOW.md) · query layer: [`docs/QUERY.md`](docs/QUERY.md) ·
 per-language mapping: [`docs/LANG-JS.md`](docs/LANG-JS.md), [`docs/LANG-CSS.md`](docs/LANG-CSS.md),
 [`docs/LANG-DOC.md`](docs/LANG-DOC.md), [`docs/LANG-RUST.md`](docs/LANG-RUST.md), [`docs/LANG-SWIFT.md`](docs/LANG-SWIFT.md), [`docs/LANG-PYTHON.md`](docs/LANG-PYTHON.md), [`docs/LANG-GO.md`](docs/LANG-GO.md) (the detailed docs are currently in Hungarian).
 
