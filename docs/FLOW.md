@@ -74,8 +74,9 @@ Korlátok: nincs SQL-parse (a kulcs a PHP-ból jön), dinamikus hívás / `__get
 (`unknown`), a fixpont flow-érzéketlen (egy változó egy metódusban egy irokészlet). A `c:` visszatérés
 híváspont-pontos: a `p:` paramétert az adott hívás argumentumai helyettesítik, így egy literál argumentumú hívás nem
 örökli más hívások oszlopát. A gettereken át olvasott `prop:` a létrehozási helyhez kötődik (konstruktor-argumentumok,
-`parent::__construct` forwarding, paraméteren át kapott objektum); a setter-írások és a `$this`-lánc továbbra is
-globális (teljes pont-elemzés: következő lépés).
+`parent::__construct` forwarding, paraméteren át kapott objektum), a setter-írások és a `$this->m()` lánc pedig a hívás
+helyének fogadójához (call-site kontextus); ismeretlen fogadó esetén globális fallback. Kivétel: egy `$this`-láncon
+belüli `$this->setX()` továbbra is globális.
 
 ## Külső plugin (bármilyen nyelven)
 
