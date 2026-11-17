@@ -10,6 +10,7 @@ pub mod literal;
 pub mod local;
 pub mod model;
 pub mod plugin;
+pub mod sql;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;

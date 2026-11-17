@@ -21,6 +21,8 @@ mago-allocator = "=1.59.0"
 mago-database = "=1.59.0"
 mago-span = "=1.59.0"
 jsonc-parser = { version = "=0.34.0", features = ["serde"] }
+# MySQL 8.4 SQL parser (the flow reader: table/column extraction from SELECT)
+sqlparser = { version = "=0.64.0", default-features = false, features = ["std"] }
 oxc_allocator = "=0.157.0"
 oxc_ast = "=0.157.0"
 oxc_syntax = "=0.157.0"
