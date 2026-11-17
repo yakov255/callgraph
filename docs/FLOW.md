@@ -88,6 +88,40 @@ predikátumokat is kihasznál (`$flag = true|false`, `$x === null`, `isset`), az
 és a `switch` konzervatívak (may union, must metszet, gyakran üres); a property-írások `must`-ja még nincs követve,
 ezért a getteren át olvasott érték lehet may annak ellenére, hogy a konstruktor mindig beállítja.
 
+## Hydration: osztály kitöltése kód nélkül
+
+JsonMapper / Symfony Serializer / Doctrine a property-ket a PHP AST-n kívül tölti ki. Erre való a `hydrate` szabály:
+osztály + tábla + property → oszlop. Nem kell, hogy az osztály szerepeljen a forrásban.
+
+```jsonc
+{
+  "hydrate": [
+    { "class": "App\\Dto\\Hotel", "table": "hotel", "properties": { "nameEn": "name_en" } }
+  ]
+}
+```
+
+A `trace` ebből `sql:<tábla>.<oszlop>` atomot készít, így a `trace hotel.name_en` megtalálja a `$dto->nameEn`
+olvasást akkor is, ha a property-t sosem írja PHP-kód. Prioritás: handler → plugin → hydrate → kézi `map`.
+
+## Mit lát a trace
+
+- `trace <oszlop>`: minden olvasás, ahol a kulcs/property/kódott oszlop megjelenik (may), `[must]` a minden úton
+  eljutó olvasásokon.
+- `trace <tábla>.<oszlop>`: a tábla is szűr (a `flow map` / `hydrate` megfeleltetésből); enélkül az `id`/`del`
+  típusú nevek minden táblát összemosnak.
+- Interfészen át hívott metódus: a visszatérés az összes implementációból unió (may), must csak ha minden
+  implementáció garantálja; trait-metódus a használó osztályon keresztül oldódik fel.
+- Legacy konstrukciók: `try`/`catch`/`finally`, `list()` / `[...]` destructuring, `yield` / `yield from`,
+  `array_column($rows, 'oszlop')`, statikus `call_user_func([$this,'m'], …)`.
+
+## További korlátok
+
+- `extract($row)`, `fetchObject()` + `$row->oszlop`, `__get`/`__set`, `get_object_vars`, `foreach ($row as $k => $v)`
+  kulcsneve: továbbra sem követett (plugin/manual map szükséges).
+- A `prop:` `must` csak a konstruktor-írásokból számol; setterek must-ja konzervatív.
+- `switch`/`match` és ciklusok közelítők; a `match` értékének must-ja üres.
+
 ## Külső plugin (bármilyen nyelven)
 
 A parancs **egyszer** fut le projektenként: a stdin-en megkapja az összes osztály JSON-ját, a stdout-ra a
