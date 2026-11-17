@@ -211,3 +211,73 @@ class Repo
         "literal call inherited another call site: {traces:#?}"
     );
 }
+
+#[test]
+fn allocation_site_binds_the_property_read() {
+    let dir = fixture_dir(
+        "alloc",
+        &[
+            (
+                "src/Item.php",
+                r#"<?php
+namespace App;
+
+class Item
+{
+    public function __construct(private string $name)
+    {
+    }
+
+    public function getName(): string
+    {
+        return $this->name;
+    }
+}
+"#,
+            ),
+            (
+                "src/UseCase.php",
+                r#"<?php
+namespace App;
+
+class UseCase
+{
+    public function literal(): void
+    {
+        $item = new Item('literal');
+        if ($item->getName() === 'literal') {
+            $a = 1;
+        }
+    }
+
+    public function fromRow(): void
+    {
+        $row = $this->connection->fetchAssociative('SELECT * FROM items');
+        $item = new Item($row['name_en']);
+        if ($item->getName() === 'row') {
+            $b = 2;
+        }
+    }
+}
+"#,
+            ),
+        ],
+    );
+    let files = scan_flow(&dir).unwrap();
+    let index = Index::build(&files);
+    let traces = index.traces("name_en");
+    let _ = fs::remove_dir_all(&dir);
+
+    assert!(
+        traces
+            .iter()
+            .any(|trace| trace.method.ends_with("UseCase::fromRow")),
+        "{traces:#?}"
+    );
+    assert!(
+        !traces
+            .iter()
+            .any(|trace| trace.method.ends_with("UseCase::literal")),
+        "the literal allocation inherited another object's column: {traces:#?}"
+    );
+}
