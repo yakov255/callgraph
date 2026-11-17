@@ -112,8 +112,27 @@ impl Index {
     /// Построить индекс с учётом наследования: `parents` — класс → прямые родители (полные имена).
     /// Пустая карта — без наследования.
     pub fn build_with_parents(files: &[FlowFile], parents: &HashMap<String, Vec<String>>) -> Self {
+        Self::build_with_parents_and_mapping(files, parents, &crate::flow::Mapping::default())
+    }
+
+    /// То же, но сопоставление `(класс, property) → sql:` применяется до единственного фикспойнта.
+    pub fn build_with_parents_and_mapping(
+        files: &[FlowFile],
+        parents: &HashMap<String, Vec<String>>,
+        mapping: &crate::flow::Mapping,
+    ) -> Self {
         let mut index = Self {
             parents: parents.clone(),
+            mapping: mapping
+                .columns
+                .iter()
+                .map(|((class, property), column)| {
+                    (
+                        (class.clone(), property.clone()),
+                        (column.table.clone(), column.column.clone()),
+                    )
+                })
+                .collect(),
             ..Self::default()
         };
         for (class, direct) in parents {
@@ -346,7 +365,16 @@ impl Index {
         let mut traces = Vec::new();
         for read in &self.reads {
             let set = self.read_origins(read);
-            let Some(matched) = match_atom(&set, &term, &key_atom, &prop_suffix) else {
+            let mut pair = None;
+            let matched = match match_atom(&set, &term, &key_atom, &prop_suffix) {
+                Some(found) => Some(found),
+                None if term.contains('.') => {
+                    pair = find_sql_pair(&set, &term);
+                    pair.as_ref().map(|(sql, _, _)| sql.clone())
+                }
+                None => None,
+            };
+            let Some(matched) = matched else {
                 continue;
             };
             // Колонка — сам совпавший атом; для совпадения по последнему сегменту — голый терм.
@@ -359,8 +387,12 @@ impl Index {
                 term.clone()
             };
             let must = self.read_must(read);
+            let must_flag = must_atom(&must, &matched)
+                || pair
+                    .as_ref()
+                    .is_some_and(|(_, key, row)| must.contains(key) && must.contains(row));
             traces.push(Trace {
-                must: must_atom(&must, &matched),
+                must: must_flag,
                 column,
                 chain: self.chain(read, &matched),
                 file: read.file.clone(),
@@ -1100,6 +1132,7 @@ impl Index {
     }
 
     /// Полное множество истоков чтения: сами истоки плюс раскрытие с контекстом получателя.
+    /// Пары `key:<column>` + `row:<table>` достраиваются до `sql:<table>.<column>`.
     fn read_origins(&self, read: &ReadFact) -> BTreeSet<String> {
         let mut set = BTreeSet::new();
         for origin in &read.origins {
@@ -1125,6 +1158,8 @@ impl Index {
         }
         // Терминальные атомы: исток сам по себе.
         if atom.starts_with("key:")
+            || atom.starts_with("row:")
+            || atom.starts_with("sql:")
             || atom.starts_with("new:")
             || atom == "lit"
             || atom == "unknown"
@@ -1167,6 +1202,7 @@ impl Index {
     }
 
     /// `must`-замыкание чтения: раскрытие `read.must`; пусто — гарантии нет.
+    /// `sql:`-атом гарантирован, только если гарантированы и `key:`, и `row:`.
     fn read_must(&self, read: &ReadFact) -> BTreeSet<String> {
         let mut set = BTreeSet::new();
         for origin in &read.must {
@@ -1213,7 +1249,68 @@ impl Index {
     }
 
     /// Цепочка от совпавшего атома до истока чтения, который его содержит.
+    /// `sql:`-атом, полученный из пары `key:` + `row:`, показывается вместе с этой парой.
     fn chain(&self, read: &ReadFact, matched: &str) -> Vec<String> {
+        let pairs = self.read_pairs(read);
+        if let Some((_, key, row)) = pairs.iter().find(|pair| pair.0 == matched) {
+            let mut chain = vec![display_atom(matched)];
+            for atom in self.chain_path(read, key) {
+                if !chain.contains(&atom) {
+                    chain.push(atom);
+                }
+            }
+            let row = display_atom(row);
+            if !chain.contains(&row) {
+                chain.push(row);
+            }
+            return chain;
+        }
+        let mut chain = self.chain_path(read, matched);
+        let mut extras: Vec<String> = Vec::new();
+        for (sql, key, row) in &pairs {
+            if matched != key && matched != row {
+                continue;
+            }
+            // Пара, из которой получен `sql:`-атом: соседний атом и сам `sql:`.
+            let other = if matched == key { row } else { key };
+            for atom in [other, sql] {
+                let atom = display_atom(atom);
+                if !extras.contains(&atom) {
+                    extras.push(atom);
+                }
+            }
+        }
+        for atom in extras.into_iter().take(ATOM_LIMIT) {
+            if chain.contains(&atom) {
+                continue;
+            }
+            chain.insert(1.min(chain.len()), atom);
+        }
+        chain
+    }
+
+    /// Пары раскрытия чтения: `(sql:, key:, row:)` для каждого `key:<column>` × `row:<table>`.
+    fn read_pairs(&self, read: &ReadFact) -> Vec<(String, String, String)> {
+        let set = self.read_origins(read);
+        let keys: Vec<&String> = set.iter().filter(|atom| atom.starts_with("key:")).collect();
+        let rows: Vec<&String> = set.iter().filter(|atom| atom.starts_with("row:")).collect();
+        let mut pairs = Vec::new();
+        for key in keys.iter().take(16) {
+            for row in rows.iter().take(16) {
+                let column = &key["key:".len()..];
+                let table = &row["row:".len()..];
+                pairs.push((
+                    format!("sql:{table}.{column}"),
+                    (*key).clone(),
+                    (*row).clone(),
+                ));
+            }
+        }
+        pairs
+    }
+
+    /// Цепочка по рёбрам раскрытия от совпавшего атома до истока чтения.
+    fn chain_path(&self, read: &ReadFact, matched: &str) -> Vec<String> {
         let mut origins: Vec<&String> = read.origins.iter().collect();
         origins.sort();
         origins.dedup();
@@ -1406,6 +1503,31 @@ fn must_merge<K: std::hash::Hash + Eq>(
 }
 
 /// Совпавший атом гарантирован на каждом пути: его база есть в `must`-замыкании.
+/// Пара `key:<column>` + `row:<table>`, дающая `sql:<table>.<column>`, для квалифицированного терма.
+fn find_sql_pair(set: &BTreeSet<String>, term: &str) -> Option<(String, String, String)> {
+    let columns: Vec<&String> = set
+        .iter()
+        .filter(|atom| atom.starts_with("key:"))
+        .take(16)
+        .collect();
+    let rows: Vec<&String> = set
+        .iter()
+        .filter(|atom| atom.starts_with("row:"))
+        .take(16)
+        .collect();
+    for key in columns {
+        for row in &rows {
+            let column = &key["key:".len()..];
+            let table = &row["row:".len()..];
+            let sql = format!("sql:{table}.{column}");
+            if format!("{table}.{column}").eq_ignore_ascii_case(term) {
+                return Some((sql, key.clone(), (*row).clone()));
+            }
+        }
+    }
+    None
+}
+
 fn must_atom(must: &BTreeSet<String>, matched: &str) -> bool {
     let base = atom_base(matched);
     must.iter().any(|atom| atom_base(atom) == base)
@@ -1464,7 +1586,7 @@ fn match_atom(
     key_atom: &str,
     prop_suffix: &str,
 ) -> Option<String> {
-    let qualified = term.matches('.').count() == 1;
+    let qualified = term.contains('.');
     let mut prop = None;
     let mut bare = None;
     for atom in set {
@@ -2285,6 +2407,94 @@ mod tests {
         let traces = index.traces("name_en");
         assert_eq!(traces.len(), 1, "{traces:#?}");
         assert_eq!(traces[0].column, "sql:items.name_en");
+    }
+
+    /// `key:<column>` + `row:<table>` дают `sql:<table>.<column>`; оба исходных атома остаются.
+    #[test]
+    fn key_and_row_pair_into_the_sql_atom() {
+        let mut run = method("A::run");
+        run.reads.push(read(
+            4,
+            "$row['service_type']",
+            &["key:service_type", "row:api_queue.queue"],
+        ));
+        let index = Index::build(&[file("a.php", vec![run])]);
+
+        let traces = index.traces("service_type");
+        assert_eq!(traces.len(), 1, "{traces:#?}");
+        assert!(has(&traces[0], "key:service_type"));
+        assert!(has(&traces[0], "row:api_queue.queue"));
+        assert!(has(&traces[0], "sql:api_queue.queue.service_type"));
+
+        // Квалифицированный терм `schema.table.column` находит то же чтение.
+        let qualified = index.traces("api_queue.queue.service_type");
+        assert_eq!(qualified.len(), 1, "{qualified:#?}");
+        assert_eq!(qualified[0].column, "sql:api_queue.queue.service_type");
+        assert_eq!(qualified[0].line, 4);
+        assert!(has(&qualified[0], "key:service_type"));
+    }
+
+    /// Две колонки × две таблицы: полное произведение `sql:`-атомов, множество ограничено.
+    #[test]
+    fn key_row_pairs_form_a_bounded_cross_product() {
+        let mut run = method("A::run");
+        run.reads.push(read(
+            4,
+            "$row",
+            &[
+                "key:id",
+                "key:service_type",
+                "row:api_queue.queue",
+                "row:api_queue.job",
+            ],
+        ));
+        let index = Index::build(&[file("a.php", vec![run])]);
+
+        // Пары строятся лениво при поиске, а не в каждом множестве чтения.
+        let set = index.read_origins(&index.reads[0]);
+        assert!(set.len() <= ATOM_LIMIT, "{set:#?}");
+        assert!(set.contains("key:id") && set.contains("row:api_queue.job"));
+        assert!(!set.iter().any(|atom| atom.starts_with("sql:")));
+        for term in [
+            "api_queue.queue.id",
+            "api_queue.queue.service_type",
+            "api_queue.job.id",
+            "api_queue.job.service_type",
+        ] {
+            assert_eq!(index.traces(term).len(), 1, "{term}");
+        }
+    }
+
+    /// `must`: `sql:`-атом гарантирован, только если в `must` есть и `key:`, и `row:`.
+    #[test]
+    fn must_pairing_requires_both_key_and_row() {
+        let mut run = method("A::run");
+        run.reads.push(read_must(
+            4,
+            "$row['id']",
+            &["key:id", "row:api_queue.queue"],
+            &["key:id", "row:api_queue.queue"],
+        ));
+        run.reads.push(read_must(
+            6,
+            "$row['id']",
+            &["key:id", "row:api_queue.queue"],
+            &["key:id"],
+        ));
+        let index = Index::build(&[file("a.php", vec![run])]);
+
+        let traces = index.traces("api_queue.queue.id");
+        assert_eq!(traces.len(), 2, "{traces:#?}");
+        let paired = traces
+            .iter()
+            .find(|trace| trace.line == 4)
+            .expect("paired read");
+        assert!(paired.must, "{paired:#?}");
+        let key_only = traces
+            .iter()
+            .find(|trace| trace.line == 6)
+            .expect("key-only read");
+        assert!(!key_only.must, "{key_only:#?}");
     }
 
     /// Именованный аргумент `new Item(name: $key)` попадает в `p:Item::__construct#0`.

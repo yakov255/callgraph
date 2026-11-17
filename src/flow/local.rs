@@ -10,6 +10,7 @@ use mago_span::HasSpan;
 use mago_syntax::cst::*;
 
 use super::model::{ArgEdge, Assign, FlowFile, MethodFlow, MethodTypes, Read, ReceiverEdge};
+use super::sql::{SqlShape, is_db_call, parse_sql};
 use crate::lang::php::analysis::NameResolver;
 use crate::lang::php::analysis::docblock::doc_comment_before;
 use crate::lang::php::parser::{MagoAdapter, ParsedFile, PhpParser};
@@ -17,6 +18,8 @@ use crate::lang::php::printer::lossy;
 
 /// Максимум атомов в одном наборе истоков.
 const MAX_ATOMS: usize = 16;
+/// Максимум `row:`-атомов в одном наборе: источники строк не должны вытеснять ключи.
+const MAX_ROWS: usize = 4;
 /// Максимум вложенных ветвлений, которые анализ различает по путям.
 const MAX_DEPTH: u32 = 4;
 /// Максимум одновременных живых путей.
@@ -475,6 +478,10 @@ struct FlowState {
     offsets: HashMap<String, HashSet<String>>,
     /// Переменные-ключи `foreach ($row as $k => $v)`.
     keys: HashSet<String>,
+    /// Источники строк: `$row` -> разобранный SELECT, из которого он получен.
+    row_sources: HashMap<String, SqlShape>,
+    /// Разобранные SQL-константы: `$sql` -> `SqlShape` (только статический SQL; пусто — динамика).
+    sql_consts: HashMap<String, SqlShape>,
     /// После `extract($arr)` неизвестная переменная читается как `key:<name>`.
     extracted: bool,
     /// Путь завершён (`return`): до конца блока записи не идут.
@@ -839,12 +846,30 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
         let iterable = self.origins(node.expression);
         let iterable_must = self.origins_must(node.expression);
         let element = self.type_of(node.expression);
+        // Источник строк итерируемого массива: элемент наследует таблицу.
+        let iterable_row = direct_var_name(node.expression)
+            .and_then(|name| self.state.row_sources.get(&name).cloned());
         self.loop_fixpoint(before.clone(), Some(before.clone()), true, true, |this| {
             if let Some(name) = direct_var_name(node.target.value()) {
-                this.set_var(&name, &iterable, &iterable_must);
+                let mut element_origins = iterable.clone();
+                if let Some(shape) = &iterable_row
+                    && let Some(table) = &shape.table
+                {
+                    element_origins.push(format!("row:{table}"));
+                }
+                this.set_var(&name, &element_origins, &iterable_must);
                 this.state.offsets.remove(&name);
                 this.state.bools.remove(&name);
                 this.state.nulls.remove(&name);
+                this.state.sql_consts.remove(&name);
+                match &iterable_row {
+                    Some(shape) => {
+                        this.state.row_sources.insert(name.clone(), shape.clone());
+                    }
+                    None => {
+                        this.state.row_sources.remove(&name);
+                    }
+                }
                 if let Some(element) = &element {
                     this.state.types.insert(name, element.clone());
                 }
@@ -853,6 +878,8 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
                 && let Some(name) = direct_var_name(key)
             {
                 this.set_var(&name, &["unknown".to_string()], &[]);
+                this.state.row_sources.remove(&name);
+                this.state.sql_consts.remove(&name);
                 this.state.keys.insert(name);
             }
             this.statements(node.body.statements());
@@ -1437,6 +1464,12 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
         self.state
             .offsets
             .retain(|base, keys| before.offsets.get(base).is_some_and(|known| known == keys));
+        self.state
+            .row_sources
+            .retain(|name, shape| before.row_sources.get(name) == Some(shape));
+        self.state
+            .sql_consts
+            .retain(|name, shape| before.sql_consts.get(name) == Some(shape));
         let changed: Vec<String> = self
             .state
             .vars
@@ -1498,6 +1531,7 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
             Expression::Variable(Variable::Direct(variable)) => {
                 let name = lossy(variable.name);
                 self.set_var(&name, &origins, &must);
+                self.track_value(&name, node.rhs, &origins);
                 self.facts(&name, node.rhs);
                 if let Some(ty) = ty {
                     self.state.types.insert(name.clone(), ty);
@@ -1561,6 +1595,9 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
                 };
                 // Запись в элемент: значение всего массива не гарантировано.
                 self.set_var(&base, &origins, &[]);
+                // Элемент перезаписан: источник строки больше не про всю переменную.
+                self.state.row_sources.remove(&base);
+                self.state.sql_consts.remove(&base);
                 if let Some((_, text)) = self.literal_key(access.index) {
                     self.flow.assigns.push(Assign {
                         line,
@@ -1575,6 +1612,8 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
                     return origins;
                 };
                 self.set_var(&base, &origins, &[]);
+                self.state.row_sources.remove(&base);
+                self.state.sql_consts.remove(&base);
                 self.flow.assigns.push(Assign {
                     line,
                     lhs: format!("{base}[]"),
@@ -1622,6 +1661,8 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
             _ => {
                 if let Some(name) = direct_var_name(value) {
                     self.set_var(&name, origins, &[]);
+                    self.state.row_sources.remove(&name);
+                    self.state.sql_consts.remove(&name);
                     self.flow.assigns.push(Assign {
                         line,
                         lhs: name,
@@ -1763,6 +1804,12 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
                     }
                 }
                 if key.is_some() {
+                    if let Some(base) = direct_var_name(access.array)
+                        && let Some(shape) = self.state.row_sources.get(&base)
+                        && let Some(table) = &shape.table
+                    {
+                        origins.push(format!("row:{table}"));
+                    }
                     self.record_read(expression, origins.clone(), must.clone());
                 }
                 norm(origins)
@@ -1918,6 +1965,60 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
 
     // -- вызовы -------------------------------------------------------------
 
+    /// Разобранный SELECT вызова БД: первый аргумент — литерал или
+    /// переменная со строковой константой. `None` — SQL динамический.
+    fn db_shape(&self, call: &Call<'a>) -> Option<SqlShape> {
+        let name = db_call_name(call)?;
+        if !is_db_call(&name) {
+            return None;
+        }
+        let first = call.get_argument_list().arguments.iter().next()?;
+        let value = argument_value(first);
+        if let Some(sql) = string_literal_value(value) {
+            return parse_sql(&sql);
+        }
+        direct_var_name(value).and_then(|name| self.state.sql_consts.get(&name).cloned())
+    }
+
+    /// Источник строк правой части присваивания: переменная с источником
+    /// или вызов БД.
+    fn row_shape(&self, rhs: &Expression<'a>) -> Option<SqlShape> {
+        if let Some(name) = direct_var_name(rhs) {
+            return self.state.row_sources.get(&name).cloned();
+        }
+        if let Expression::Call(call) = rhs.unparenthesized() {
+            return self.db_shape(call);
+        }
+        None
+    }
+
+    /// Источник строк и разобранный SQL после `=`: `$a = $b` наследует,
+    /// любая другая правая часть сбрасывает.
+    fn track_value(&mut self, name: &str, rhs: &Expression<'a>, origins: &[String]) {
+        let shape = string_literal_value(rhs)
+            .and_then(|sql| parse_sql(&sql))
+            .or_else(|| {
+                direct_var_name(rhs).and_then(|source| self.state.sql_consts.get(&source).cloned())
+            });
+        match shape {
+            Some(shape) => {
+                self.state.sql_consts.insert(name.to_string(), shape);
+            }
+            None => {
+                self.state.sql_consts.remove(name);
+            }
+        }
+        let shape = self.row_shape(rhs);
+        if origins.iter().any(|atom| atom.starts_with("row:"))
+            && let Some(shape) = shape
+            && shape.table.is_some()
+        {
+            self.state.row_sources.insert(name.to_string(), shape);
+        } else {
+            self.state.row_sources.remove(name);
+        }
+    }
+
     /// Вызов: рёбра аргументов, исток `c:<target>@<line>` и (для значения) чтение.
     fn call(&mut self, call: &Call<'a>, used: bool) -> Vec<String> {
         if let Some(origins) = self.array_column(call, used) {
@@ -1955,15 +2056,30 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
             });
         }
         self.arguments(call.get_argument_list(), target.as_deref(), line);
+        // Вызов БД даёт исток строки даже при неизвестном типе получателя.
+        let row_atom = self
+            .db_shape(call)
+            .and_then(|shape| shape.table)
+            .map(|table| format!("row:{table}"));
         match target {
             Some(target) => {
-                let origins = vec![format!("c:{target}@{line}")];
+                let mut origins = vec![format!("c:{target}@{line}")];
+                origins.extend(row_atom);
+                let origins = norm(origins);
                 if used {
                     self.record_read(call, origins.clone(), origins.clone());
                 }
                 origins
             }
-            None => vec!["unknown".into()],
+            None => match row_atom {
+                Some(atom) => {
+                    if used {
+                        self.record_read(call, vec![atom.clone()], vec![atom.clone()]);
+                    }
+                    vec![atom]
+                }
+                None => vec!["unknown".into()],
+            },
         }
     }
 
@@ -2096,6 +2212,8 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
         nested.state.vars = self.state.vars.clone();
         nested.state.must = self.state.must.clone();
         nested.state.keys = self.state.keys.clone();
+        nested.state.row_sources = self.state.row_sources.clone();
+        nested.state.sql_consts = self.state.sql_consts.clone();
         nested.state.extracted = self.state.extracted;
         nested.closure_params(&closure.parameter_list);
         nested.statements(closure.body.statements.as_slice());
@@ -2620,6 +2738,10 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
                 }
             }
         }
+        let rows = merge_row_sources(&before.row_sources, &self.state.row_sources);
+        let consts = merge_sql_consts(&before.sql_consts, &self.state.sql_consts);
+        self.state.row_sources = rows;
+        self.state.sql_consts = consts;
     }
 
     /// Установить значение переменной: may — union, must — сильное обновление.
@@ -2718,6 +2840,67 @@ fn hint_type(parsed: &ParsedFile<'_>, resolver: &NameResolver, hint: &Hint<'_>) 
     Some(resolver.resolve_class(raw))
 }
 
+/// Короткое имя цели вызова: после `::` или последнего `\`.
+fn short_name(target: &str) -> &str {
+    target
+        .rsplit("::")
+        .next()
+        .unwrap_or(target)
+        .rsplit('\\')
+        .next()
+        .unwrap_or(target)
+}
+
+/// Короткое имя вызываемого метода/функции без типа получателя.
+fn db_call_name(call: &Call<'_>) -> Option<String> {
+    let name = match call {
+        Call::Function(node) => match node.function.unparenthesized() {
+            Expression::Identifier(identifier) => lossy(identifier.value()),
+            _ => return None,
+        },
+        Call::Method(node) => match &node.method {
+            ClassLikeMemberSelector::Identifier(method) => lossy(method.value),
+            _ => return None,
+        },
+        Call::NullSafeMethod(node) => match &node.method {
+            ClassLikeMemberSelector::Identifier(method) => lossy(method.value),
+            _ => return None,
+        },
+        Call::StaticMethod(node) => match &node.method {
+            ClassLikeMemberSelector::Identifier(method) => lossy(method.value),
+            _ => return None,
+        },
+    };
+    Some(short_name(name.trim_start_matches('\\')).to_string())
+}
+
+/// Значение литеральной строки: кавычки, heredoc/nowdoc, статическая
+/// интерполяция без выражений. `None` — значение неизвестно.
+fn string_literal_value(expression: &Expression<'_>) -> Option<String> {
+    match expression.unparenthesized() {
+        Expression::Literal(Literal::String(string)) => string.value.map(lossy),
+        Expression::CompositeString(CompositeString::Document(document)) => {
+            string_parts_value(&document.parts)
+        }
+        Expression::CompositeString(CompositeString::Interpolated(interpolated)) => {
+            string_parts_value(&interpolated.parts)
+        }
+        _ => None,
+    }
+}
+
+/// Склеить литеральные части строки; выражение внутри делает строку динамической.
+fn string_parts_value(parts: &Sequence<'_, StringPart<'_>>) -> Option<String> {
+    let mut value = String::new();
+    for part in parts.iter() {
+        let StringPart::Literal(literal) = part else {
+            return None;
+        };
+        value.push_str(&lossy(literal.value?));
+    }
+    Some(value)
+}
+
 /// `$this` (без учёта скобок).
 fn is_this(expression: &Expression<'_>) -> bool {
     matches!(
@@ -2764,6 +2947,14 @@ fn significant(origins: &[String]) -> bool {
 fn norm(mut origins: Vec<String>) -> Vec<String> {
     let mut seen = HashSet::new();
     origins.retain(|atom| seen.insert(atom.clone()));
+    let mut rows = 0;
+    origins.retain(|atom| {
+        if atom.starts_with("row:") {
+            rows += 1;
+            return rows <= MAX_ROWS;
+        }
+        true
+    });
     origins.truncate(MAX_ATOMS);
     origins
 }
@@ -2860,9 +3051,42 @@ fn merge_states(left: FlowState, right: FlowState) -> FlowState {
         nulls,
         offsets,
         keys,
+        row_sources: merge_row_sources(&left.row_sources, &right.row_sources),
+        sql_consts: merge_sql_consts(&left.sql_consts, &right.sql_consts),
         extracted: left.extracted || right.extracted,
         terminated: false,
     }
+}
+
+/// Источники строк после слияния: остаются только совпавшие по таблице.
+fn merge_row_sources(
+    left: &HashMap<String, SqlShape>,
+    right: &HashMap<String, SqlShape>,
+) -> HashMap<String, SqlShape> {
+    let mut merged = HashMap::new();
+    for (name, shape) in left {
+        let Some(other) = right.get(name) else {
+            continue;
+        };
+        if shape.table.is_some() && shape.table == other.table {
+            merged.insert(name.clone(), shape.clone());
+        }
+    }
+    merged
+}
+
+/// Строковые константы после слияния: только одинаковые значения.
+fn merge_sql_consts(
+    left: &HashMap<String, SqlShape>,
+    right: &HashMap<String, SqlShape>,
+) -> HashMap<String, SqlShape> {
+    let mut merged = HashMap::new();
+    for (name, value) in left {
+        if right.get(name) == Some(value) {
+            merged.insert(name.clone(), value.clone());
+        }
+    }
+    merged
 }
 
 /// Литерал `null`.
@@ -3404,6 +3628,174 @@ class QueueRepository
             edge.origins.iter().any(|atom| atom == "key:service_type"),
             "{:?}",
             edge.origins
+        );
+    }
+
+    #[test]
+    fn foreach_row_carries_table_to_call_argument() {
+        let source = r#"<?php
+class QueueRepository
+{
+    private $connection;
+
+    public function run()
+    {
+        $rows = $this->connection->fetchAllAssociative('SELECT id, service_type FROM api_queue.queue', []);
+        foreach ($rows as $row) {
+            $this->makeEntity($row);
+        }
+    }
+
+    public function makeEntity($row)
+    {
+    }
+}
+"#;
+        let files = facts(source);
+        let run = method(&files, "QueueRepository::run");
+        let edge = run
+            .args
+            .iter()
+            .find(|edge| edge.target == "QueueRepository::makeEntity" && edge.index == 0)
+            .expect("нет аргумента makeEntity");
+        assert!(
+            edge.origins
+                .iter()
+                .any(|atom| atom == "row:api_queue.queue"),
+            "{:?}",
+            edge.origins
+        );
+    }
+
+    #[test]
+    fn row_column_read_keeps_key_and_table() {
+        let source = r#"<?php
+class QueueRepository
+{
+    private $connection;
+
+    public function find()
+    {
+        $row = $this->connection->fetchAssociative('SELECT service_type FROM api_queue.queue');
+        $x = $row['service_type'];
+    }
+}
+"#;
+        let files = facts(source);
+        let find = method(&files, "QueueRepository::find");
+        let read = find
+            .reads
+            .iter()
+            .find(|read| read.origins.iter().any(|atom| atom == "key:service_type"))
+            .expect("нет чтения колонки");
+        assert!(
+            read.origins
+                .iter()
+                .any(|atom| atom == "row:api_queue.queue"),
+            "{:?}",
+            read.origins
+        );
+    }
+
+    #[test]
+    fn sql_string_variable_keeps_table() {
+        let source = r#"<?php
+class QueueRepository
+{
+    private $connection;
+
+    public function find()
+    {
+        $sql = 'SELECT service_type FROM api_queue.queue';
+        $row = $this->connection->fetchAssociative($sql);
+        $x = $row['service_type'];
+    }
+}
+"#;
+        let files = facts(source);
+        let find = method(&files, "QueueRepository::find");
+        let read = find
+            .reads
+            .iter()
+            .find(|read| read.origins.iter().any(|atom| atom == "key:service_type"))
+            .expect("нет чтения колонки");
+        assert!(
+            read.origins
+                .iter()
+                .any(|atom| atom == "row:api_queue.queue"),
+            "{:?}",
+            read.origins
+        );
+    }
+
+    #[test]
+    fn non_db_and_dynamic_sql_calls_create_no_row_source() {
+        let source = r#"<?php
+class QueueRepository
+{
+    private $connection;
+
+    public function find($suffix)
+    {
+        $sql = 'SELECT service_type FROM api_queue.queue WHERE id = ' . $suffix;
+        $row = $this->connection->fetchAssociative($sql);
+        $x = $row['service_type'];
+        $this->makeEntity('SELECT id FROM api_queue.queue');
+    }
+
+    public function makeEntity($row)
+    {
+    }
+}
+"#;
+        let files = facts(source);
+        let find = method(&files, "QueueRepository::find");
+        assert!(
+            find.reads
+                .iter()
+                .all(|read| read.origins.iter().all(|atom| !atom.starts_with("row:"))),
+            "{:?}",
+            find.reads
+        );
+        assert!(
+            find.args
+                .iter()
+                .all(|edge| edge.origins.iter().all(|atom| !atom.starts_with("row:"))),
+            "{:?}",
+            find.args
+        );
+    }
+
+    #[test]
+    fn heredoc_sql_variable_keeps_table() {
+        let source = r#"<?php
+class QueueRepository
+{
+    private $connection;
+
+    public function find()
+    {
+        $sql = <<<SQL
+SELECT service_type FROM api_queue.queue
+SQL;
+        $row = $this->connection->fetchAssociative($sql);
+        $x = $row['service_type'];
+    }
+}
+"#;
+        let files = facts(source);
+        let find = method(&files, "QueueRepository::find");
+        let read = find
+            .reads
+            .iter()
+            .find(|read| read.origins.iter().any(|atom| atom == "key:service_type"))
+            .expect("нет чтения колонки");
+        assert!(
+            read.origins
+                .iter()
+                .any(|atom| atom == "row:api_queue.queue"),
+            "{:?}",
+            read.origins
         );
     }
 

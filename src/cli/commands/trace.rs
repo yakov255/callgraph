@@ -58,7 +58,7 @@ impl Command for TraceCommand {
         // Сопоставление даёт `sql:`-атомы: `prop:` привязывается к таблице/колонке,
         // а `<table>.<column>` фильтрует по таблице.
         let mapping = scan_project(&root)?;
-        let index = Index::build_with_parents(&files, &parents).with_mapping(&mapping);
+        let index = Index::build_with_parents_and_mapping(&files, &parents, &mapping);
         let mut groups: Vec<(String, Vec<Trace>)> = Vec::with_capacity(self.terms.len());
         for term in &self.terms {
             let mut traces = if split_qualified(term).is_some() {
