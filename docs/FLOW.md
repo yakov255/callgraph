@@ -71,9 +71,10 @@ v1/src/Operation/GetQueueOperation.php  Api\Queue\V1\Operation\GetQueueOperation
 ```
 
 Korlátok: nincs SQL-parse (a kulcs a PHP-ból jön), dinamikus hívás / `__get` / `extract` esetén a lánc megszakad
-(`unknown`), a fixpont flow-érzéketlen (egy változó egy metódusban egy irokészlet), és a `c:` visszatérési érték
-minden hívási hely paramétereit egyesíti — ugyanaz a függvény literál argumentummal is örökölheti egy másik hívás
-oszlopát (híváspont-pontos visszatérés: következő lépés).
+(`unknown`), a fixpont flow-érzéketlen (egy változó egy metódusban egy irokészlet). A `c:` visszatérés
+híváspont-pontos: a `p:` paramétert az adott hívás argumentumai helyettesítik, így egy literál argumentumú hívás nem
+örökli más hívások oszlopát. A `prop:` írások viszont továbbra is minden létrehozási helyet egyesítenek (pontosabb
+pont-elemzés: következő lépés).
 
 ## Külső plugin (bármilyen nyelven)
 
