@@ -17,8 +17,8 @@ use super::uses_args::{parse_deps, parse_uses};
 
 fn usage() -> &'static str {
     crate::t!(
-        "callgraph [--lang <id,...>] [--cache <file>] [--no-cache] <file|dir> [...] | callgraph prune [--cache <file>] [--dry-run] | callgraph set-lang [en|hu] | callgraph self-update [--check] | callgraph note add|list|rm … | callgraph refresh [--project <alias|dir>] [--background] [<path>…] | callgraph locate <term>... [--all] [--project <alias|dir>] | callgraph hook install|uninstall|status | callgraph stats [--events] [--days N] | callgraph flow map [--project <alias|dir>] [--json] [--table <name>] [--full] | callgraph mcp [--auto-update] | callgraph --version  (any command: --no-gitignore = ignore the .gitignore files)",
-        "callgraph [--lang <id,...>] [--cache <fájl>] [--no-cache] <fájl|mappa> [...] | callgraph prune [--cache <fájl>] [--dry-run] | callgraph set-lang [en|hu] | callgraph self-update [--check] | callgraph note add|list|rm … | callgraph refresh [--project <alias|mappa>] [--background] [<út>…] | callgraph locate <kifejezés>... [--all] [--project <alias|mappa>] | callgraph hook install|uninstall|status | callgraph stats [--events] [--days N] | callgraph flow map [--project <alias|mappa>] [--json] [--table <név>] [--full] | callgraph mcp [--auto-update] | callgraph --version  (bármely parancsnál: --no-gitignore = a .gitignore fájlok nélkül)"
+        "callgraph [--lang <id,...>] [--cache <file>] [--no-cache] <file|dir> [...] | callgraph prune [--cache <file>] [--dry-run] | callgraph set-lang [en|hu] | callgraph self-update [--check] | callgraph note add|list|rm … | callgraph refresh [--project <alias|dir>] [--background] [<path>…] | callgraph locate <term>... [--all] [--project <alias|dir>] | callgraph hook install|uninstall|status | callgraph stats [--events] [--days N] | callgraph flow map [--project <alias|dir>] [--json] [--table <name>] [--full] | callgraph trace <term>... [--project <alias|dir>] [--json] [--full] | callgraph mcp [--auto-update] | callgraph --version  (any command: --no-gitignore = ignore the .gitignore files)",
+        "callgraph [--lang <id,...>] [--cache <fájl>] [--no-cache] <fájl|mappa> [...] | callgraph prune [--cache <fájl>] [--dry-run] | callgraph set-lang [en|hu] | callgraph self-update [--check] | callgraph note add|list|rm … | callgraph refresh [--project <alias|mappa>] [--background] [<út>…] | callgraph locate <kifejezés>... [--all] [--project <alias|mappa>] | callgraph hook install|uninstall|status | callgraph stats [--events] [--days N] | callgraph flow map [--project <alias|mappa>] [--json] [--table <név>] [--full] | callgraph trace <kifejezés>... [--project <alias|mappa>] [--json] [--full] | callgraph mcp [--auto-update] | callgraph --version  (bármely parancsnál: --no-gitignore = a .gitignore fájlok nélkül)"
     )
 }
 
@@ -54,6 +54,13 @@ fn refresh_usage() -> &'static str {
     crate::t!(
         "callgraph refresh [--project <alias|root>] [--background] [<file|dir> ...]  (no path: every changed / new / deleted file of the project)",
         "callgraph refresh [--project <alias|gyökér>] [--background] [<fájl|mappa> ...]  (út nélkül: a projekt minden változott / új / törölt fájlja)"
+    )
+}
+
+fn trace_usage() -> &'static str {
+    crate::t!(
+        "callgraph trace <term>... [--project <alias|dir>] [--json] [--full]  (data flow: where a DB column / array key / property is read)",
+        "callgraph trace <kifejezés>... [--project <alias|mappa>] [--json] [--full]  (adatfolyam: hol olvassák a DB-oszlopot / tömbkulcsot / property-t)"
     )
 }
 
@@ -250,6 +257,13 @@ pub enum CliArgs {
         table: Option<String>,
         full: bool,
     },
+    /// `trace`: цепочки потока данных от источника до чтения.
+    Trace {
+        terms: Vec<String>,
+        project: Option<String>,
+        json: bool,
+        full: bool,
+    },
     Version,
     /// `--help` / `-h` / `help`: a teljes súgó.
     Help,
@@ -315,6 +329,9 @@ impl CliArgs {
         }
         if args.first().is_some_and(|a| a == "flow") {
             return Self::parse_flow(&args[1..]);
+        }
+        if args.first().is_some_and(|a| a == "trace") {
+            return Self::parse_trace(&args[1..]);
         }
         }
         if args.first().is_some_and(|a| a == "hook") {
@@ -654,6 +671,43 @@ impl CliArgs {
             project,
             json,
             table,
+            full,
+        })
+    }
+
+    /// `trace <term>... [--project <alias|путь>] [--json] [--full]`.
+    fn parse_trace(args: &[String]) -> Result<Self> {
+        let usage = || CallgraphError::Usage(trace_usage().into());
+        let mut terms = Vec::new();
+        let mut project = None;
+        let mut json = false;
+        let mut full = false;
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--" => {
+                    terms.extend(args[i + 1..].iter().cloned());
+                    break;
+                }
+                "--json" => json = true,
+                "--full" => full = true,
+                "--project" if i + 1 < args.len() => {
+                    project = Some(args[i + 1].clone());
+                    i += 1;
+                }
+                x if x.starts_with("--project=") => project = Some(x[10..].to_owned()),
+                x if x.starts_with('-') && x.len() > 1 => return Err(usage()),
+                x => terms.push(x.to_owned()),
+            }
+            i += 1;
+        }
+        if terms.is_empty() || project.as_deref().is_some_and(str::is_empty) {
+            return Err(usage());
+        }
+        Ok(Self::Trace {
+            terms,
+            project,
+            json,
             full,
         })
     }

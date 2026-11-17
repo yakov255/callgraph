@@ -5,7 +5,10 @@
 //! графа потока данных.
 
 pub mod facts;
+pub mod index;
 pub mod literal;
+pub mod local;
+pub mod model;
 pub mod plugin;
 
 use std::collections::{HashMap, HashSet};
@@ -13,12 +16,15 @@ use std::path::Path;
 
 use rayon::prelude::*;
 
+pub use index::Index;
 pub use literal::Value;
+pub use model::{ArgEdge, Assign, FlowFile, MethodFlow, Read, Trace};
 pub use plugin::{ColumnRef, Config, FlowHandler, Mapping, Registry};
 
 use crate::error::Result;
 use crate::io::FileWalker;
 use facts::ClassFacts;
+use model::MethodTypes;
 
 /// PHP-классы проекта и построенное по ним сопоставление.
 pub fn scan_project(root: &Path) -> Result<Mapping> {
@@ -35,6 +41,52 @@ pub fn scan_project(root: &Path) -> Result<Mapping> {
         .collect();
     let classes = merge_inheritance(classes);
     Ok(Registry::for_project(root).apply(&classes))
+}
+
+/// Факты потока данных по всем PHP-файлам проекта (без кэша: перечитывает источник).
+///
+/// Два прохода: сначала типы возврата методов (нужны для `$x = $repo->find()` и `foreach` по `Foo[]`),
+/// затем сам анализ с этой таблицей.
+pub fn scan_flow(root: &Path) -> Result<Vec<FlowFile>> {
+    let walker = FileWalker::for_extensions(vec!["php"]);
+    let files = walker.collect(&[root.to_path_buf()], &mut |_| {});
+    let types: MethodTypes = files
+        .par_iter()
+        .flat_map(|path| {
+            let Ok(source) = std::fs::read(path) else {
+                return Vec::new();
+            };
+            local::file_return_types(&path.to_string_lossy(), &source)
+        })
+        .collect();
+    Ok(files
+        .par_iter()
+        .flat_map(|path| {
+            let Ok(source) = std::fs::read(path) else {
+                return Vec::new();
+            };
+            local::file_facts_with_types(&path.to_string_lossy(), &source, &types)
+        })
+        .collect())
+}
+
+/// Карта «класс → прямые родители» из фактов о классах (для наследования методов в `Index`).
+pub fn scan_parents(root: &Path) -> Result<HashMap<String, Vec<String>>> {
+    let walker = FileWalker::for_extensions(vec!["php"]);
+    let files = walker.collect(&[root.to_path_buf()], &mut |_| {});
+    let classes: Vec<facts::ClassFacts> = files
+        .par_iter()
+        .flat_map(|path| {
+            let Ok(source) = std::fs::read(path) else {
+                return Vec::new();
+            };
+            facts::file_facts(&path.to_string_lossy(), &source)
+        })
+        .collect();
+    Ok(classes
+        .into_iter()
+        .map(|class| (class.name, class.extends))
+        .collect())
 }
 
 /// Property родителей и цепочка `extends`, влитые в класс (ближайшее определение побеждает).
