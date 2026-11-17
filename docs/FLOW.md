@@ -84,10 +84,14 @@ belüli `$this->setX()` továbbra is globális.
 A `[must]` jelölés azt jelenti: a kolónia **minden olyan úton** eljut a reading, amely eljut magához a readinghez.
 `--must` csak ezeket listázza; alapból may („legalább egy úton”).
 
-Az elemzés path-sensitive az `if` / `elseif` / `else`, a ternáris operátor és a korai `return` esetén; egyszerű
-predikátumokat is kihasznál (`$flag = true|false`, `$x === null`, `isset`), az ellentmondó ágakat kihagyja. A ciklusok
-és a `switch` konzervatívak (may union, must metszet, gyakran üres); a property-írások `must`-ja még nincs követve,
-ezért a getteren át olvasott érték lehet may annak ellenére, hogy a konstruktor mindig beállítja.
+Az elemzés path-sensitive az `if` / `elseif` / `else`, a ternáris operátor, a `switch` és a `match` esetén, valamint
+korai `return` / `break` / `continue` mellett. A szűkítés egységes: `&&` / `||` / `!`, `$flag = true|false`, `$x === null`,
+`isset($x)`, `isset($a['k'])`, `array_key_exists('k', $a)`, `$x instanceof Foo`; ellentmondó ágakat kihagy.
+A ciklusok legfeljebb 3 menetes fixpontig futnak, és csak a testben írt változókat általánosítják; a `do-while` teste
+mindig lefut, ezért ott a `must` megmaradhat. A `switch` valódi fallthrough-t és `break`-et modellez; az „egyik case sem
+egyezett” út csak `default` nélkül marad meg. A `match` áganként külön scope-ban fut, az érték may uniója az ágaké,
+`must` csak `default` és azonos must-halmazok esetén. A property-írások `must`-ja továbbra is csak a konstruktorból
+számol, ezért a getteren át olvasott érték lehet may annak ellenére, hogy a konstruktor mindig beállítja.
 
 ## Hydration: osztály kitöltése kód nélkül
 
@@ -143,7 +147,10 @@ Mivel ezek may-only közelítések, hamis pozitívumot adhatnak: pl. a `$row->na
 - `extract($row)`, `fetchObject()` + `$row->oszlop`, `__get`/`__set`, `get_object_vars`, `foreach ($row as $k => $v)`
   kulcsneve: csak may heurisztikával követett, plugin/manual map továbbra is pontosabb.
 - A `prop:` `must` csak a konstruktor-írásokból számol; setterek must-ja konzervatív.
-- `switch`/`match` és ciklusok közelítők; a `match` értékének must-ja konzervatív (üres is lehet).
+- A `?? null` literál `lit` atomja nem különül el a többi literáltól, ezért `$x = $row['k'] ?? null; if ($x !== null)`
+  után a `null`-ág eltávolítása nem teheti `must`-tá a `key:`-t (a PHPStan-szerű conditional holder ehhez még hiányzik).
+- A `switch` exhaustiveness csak `default`-ból jön; enum-/literál-domén kimerülését nem számoljuk.
+- A `match` `must`-ja csak teljesen azonos ág-must-halmazoknál adódik (szigorú konzervatív szabály).
 
 ## Külső plugin (bármilyen nyelven)
 
@@ -204,14 +211,17 @@ Hibás plugin (nem indul el, hibás JSON) nem állítja meg a futást: `⚠ plug
 
 ## Saját, fordított handler
 
+A handler egy szűk interfészt valósít meg, és egyetlen tényt ad vissza (mint a PHPStan extensionjei):
+tábla- vagy oszlop-megfeleltetést.
+
 ```rust
-use callgraph::flow::{ClassFacts, FlowHandler, Mapping};
+use callgraph::flow::{ClassFacts, Mapping, PropertyColumnHandler};
 
 struct MyHandler;
 
-impl FlowHandler for MyHandler {
+impl PropertyColumnHandler for MyHandler {
     fn id(&self) -> &'static str { "my-handler" }
-    fn apply(&self, class: &ClassFacts, out: &mut Mapping) {
+    fn columns(&self, class: &ClassFacts, out: &mut Mapping) {
         // pl. egy konvenció: `*Entity` osztály property-je `snake_case` oszlop
         if class.short.ends_with("Entity") {
             for p in &class.properties {
@@ -222,8 +232,8 @@ impl FlowHandler for MyHandler {
 }
 ```
 
-Regisztrálás: `Registry::from_config(config).with_handler(Box::new(MyHandler))` (a `src/flow/plugin.rs`-ban, a
-`from_config` végén egy sor).
+Táblára ugyanez `ClassTableHandler`-rel (`fn table(...)`). Regisztrálás:
+`Registry::from_config(config).with_column_handler(Box::new(MyHandler))`, illetve `with_table_handler(...)`.
 
 ## Korlátok
 
