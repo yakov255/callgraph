@@ -138,3 +138,27 @@ fn write_json(
     let value = serde_json::json!({ "columns": columns });
     writeln!(out, "{}", serde_json::to_string_pretty(&value)?)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_output_shape_is_unchanged() {
+        let mut mapping = Mapping::default();
+        mapping.insert("App\\Dto\\Hotel", "nameEn", "hotel", "name_en", "hydrate");
+        let mut buf = Vec::new();
+        write_json(&mut buf, &mapping, None).expect("json");
+        let value: serde_json::Value = serde_json::from_slice(&buf).expect("json");
+        let object = value.as_object().expect("object");
+        assert_eq!(object.len(), 1);
+        let columns = object["columns"].as_array().expect("columns");
+        assert_eq!(columns.len(), 1);
+        let row = columns[0].as_object().expect("row");
+        let mut keys: Vec<&str> = row.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["class", "column", "handler", "property", "table"]);
+        assert_eq!(row["handler"], "hydrate");
+        assert_eq!(row["class"], "App\\Dto\\Hotel");
+    }
+}

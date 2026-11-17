@@ -1,7 +1,11 @@
-//! Факты о PHP-классах для flow-слоя: имя, пространство имён, `extends`, типы property и литеральные значения по умолчанию.
+//! Факты о PHP-классах для flow-слоя: имя, пространство имён, `extends`/`implements`/`use`, типы property и
+//! литеральные значения по умолчанию.
 //!
 //! `FileGraph` намеренно не хранит значения property по умолчанию (схема JSONL не меняется), поэтому flow-анализ
 //! один раз перечитывает исходник. Плагины строят из этих фактов сопоставление таблица ↔ property.
+//!
+//! Факты собираются не только для классов, но и для интерфейсов и trait-ов: без них иерархия не видит
+//! `implements`/`use`, а property из trait-а не наследуется.
 
 use mago_span::HasSpan;
 use mago_syntax::cst::*;
@@ -18,6 +22,8 @@ pub struct ClassFacts {
     pub name: String,
     pub short: String,
     pub extends: Vec<String>,
+    pub implements: Vec<String>,
+    pub traits: Vec<String>,
     pub properties: Vec<PropFacts>,
 }
 
@@ -31,22 +37,48 @@ pub struct PropFacts {
     pub promoted: bool,
 }
 
-/// Классы файла (без интерфейсов / trait-ов: для flow нужны property).
+/// Классы, интерфейсы и trait-ы файла (enum-ы не нужны: для flow важны property и иерархия).
 pub fn file_facts(path: &str, source: &[u8]) -> Vec<ClassFacts> {
     MagoAdapter.parse(path, source, |parsed| {
         let mut out = Vec::new();
         let statements = top_statements(parsed.program);
         let (namespace, resolver) = namespace_and_resolver(parsed, &statements);
+        let namespace = namespace.as_deref();
         for statement in &statements {
-            if let Statement::Class(class) = statement {
-                out.push(class_facts(
+            let facts = match statement {
+                Statement::Class(class) => class_like_facts(
                     parsed,
-                    class,
+                    class.name.value,
+                    class.extends.as_ref(),
+                    class.implements.as_ref(),
+                    &class.members,
                     path,
-                    namespace.as_deref(),
+                    namespace,
                     &resolver,
-                ));
-            }
+                ),
+                Statement::Interface(interface) => class_like_facts(
+                    parsed,
+                    interface.name.value,
+                    interface.extends.as_ref(),
+                    None,
+                    &interface.members,
+                    path,
+                    namespace,
+                    &resolver,
+                ),
+                Statement::Trait(trait_) => class_like_facts(
+                    parsed,
+                    trait_.name.value,
+                    None,
+                    None,
+                    &trait_.members,
+                    path,
+                    namespace,
+                    &resolver,
+                ),
+                _ => continue,
+            };
+            out.push(facts);
         }
         out
     })
@@ -97,30 +129,51 @@ fn namespace_and_resolver(
     (namespace, resolver)
 }
 
-fn class_facts(
-    parsed: &ParsedFile<'_>,
-    class: &Class<'_>,
+/// Факты одного class-like объявления: имя, прямые родители (`extends`, `implements`, `use`) и property.
+#[allow(clippy::too_many_arguments)]
+fn class_like_facts<'a>(
+    parsed: &ParsedFile<'a>,
+    declared: &[u8],
+    extends: Option<&Extends<'a>>,
+    implements: Option<&Implements<'a>>,
+    members: &Sequence<'a, ClassLikeMember<'a>>,
     file: &str,
     namespace: Option<&str>,
     resolver: &NameResolver,
 ) -> ClassFacts {
-    let short = String::from_utf8_lossy(class.name.value).into_owned();
+    let short = String::from_utf8_lossy(declared).into_owned();
     let name = match namespace {
         Some(ns) if !ns.is_empty() => format!("{ns}\\{short}"),
         _ => short.clone(),
     };
-    let extends = class
-        .extends
-        .as_ref()
-        .map(|e| {
-            e.types
-                .iter()
-                .map(|t| resolver.resolve_class(&parsed.text(t.span())))
-                .collect()
+    let resolve_types =
+        |types: Option<&TokenSeparatedSequence<'a, Identifier<'a>>>| -> Vec<String> {
+            types
+                .map(|types| {
+                    types
+                        .iter()
+                        .map(|t| resolver.resolve_class(&parsed.text(t.span())))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+    let extends = resolve_types(extends.map(|e| &e.types));
+    let implements = resolve_types(implements.map(|e| &e.types));
+    let traits = members
+        .iter()
+        .filter_map(|member| match member {
+            ClassLikeMember::TraitUse(use_) => Some(
+                use_.trait_names
+                    .iter()
+                    .map(|name| resolver.resolve_class(&parsed.text(name.span())))
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
         })
-        .unwrap_or_default();
+        .flatten()
+        .collect();
     let mut properties = Vec::new();
-    for member in class.members.iter() {
+    for member in members.iter() {
         match member {
             ClassLikeMember::Property(Property::Plain(p)) => {
                 let ty = p
@@ -175,6 +228,8 @@ fn class_facts(
         name,
         short,
         extends,
+        implements,
+        traits,
         properties,
     }
 }

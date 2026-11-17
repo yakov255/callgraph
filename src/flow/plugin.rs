@@ -4,6 +4,8 @@
 //! магические методы, сгенерированный код). Для этого и нужны обработчики:
 //!
 //! - встроенный `legacy-fields-map`: литеральные property `$tableName` + `$fieldsMap` (например, наследники `Billet`);
+//! - правила `hydrate` в `.callgraph-flow.json`: декларативное сопоставление для объектов, заполняемых вне AST
+//!   (JsonMapper, Symfony Serializer, Doctrine): класс, таблица и `property → column`;
 //! - правила `map` в `.callgraph-flow.json`: ручное переопределение, всегда высший приоритет;
 //! - собственный скомпилированный обработчик: реализация трейта `FlowHandler`, зарегистрированная в `Registry`.
 //!
@@ -22,7 +24,7 @@ use super::facts::{ClassFacts, PropFacts};
 pub struct ColumnRef {
     pub table: String,
     pub column: String,
-    /// Какой обработчик дал (`legacy-fields-map`, `manual`, …).
+    /// Какой обработчик дал (`legacy-fields-map`, `hydrate`, `manual`, …).
     pub handler: String,
 }
 
@@ -156,6 +158,21 @@ pub struct MapRule {
     pub column: Option<String>,
 }
 
+/// Декларативное правило для объектов, заполняемых вне AST (JsonMapper, Symfony Serializer, Doctrine).
+///
+/// Задаёт таблицу класса и явное `property → column`; правило не зависит от наличия класса в AST.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct HydrateRule {
+    #[serde(default)]
+    pub class: String,
+    #[serde(default)]
+    pub table: String,
+    /// property → колонка.
+    #[serde(default)]
+    pub properties: BTreeMap<String, String>,
+}
+
 /// Конфигурация (`<root>/.callgraph-flow.json`, JSONC: можно и с комментариями).
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -164,6 +181,8 @@ pub struct Config {
     pub handlers: Vec<HandlerConfig>,
     #[serde(default)]
     pub plugins: Vec<PluginConfig>,
+    #[serde(default)]
+    pub hydrate: Vec<HydrateRule>,
     #[serde(default)]
     pub map: Vec<MapRule>,
 }
@@ -194,6 +213,7 @@ pub struct HandlerConfig {
 pub struct Registry {
     handlers: Vec<Box<dyn FlowHandler>>,
     plugins: Vec<PluginConfig>,
+    hydrate: Vec<HydrateRule>,
     manual: Vec<MapRule>,
 }
 
@@ -226,6 +246,7 @@ impl Registry {
         Self {
             handlers,
             plugins: config.plugins,
+            hydrate: config.hydrate,
             manual: config.map,
         }
     }
@@ -236,7 +257,10 @@ impl Registry {
         self
     }
 
-    /// Построить сопоставление; ручные правила всегда перекрывают обработчики.
+    /// Построить сопоставление.
+    ///
+    /// Приоритет: встроенные обработчики, внешние плагины, затем `hydrate` (не перекрывает уже найденное)
+    /// и в конце ручные правила `map` (перекрывают всё).
     pub fn apply(&self, classes: &[ClassFacts]) -> Mapping {
         let mut mapping = Mapping::default();
         for class in classes {
@@ -258,6 +282,26 @@ impl Registry {
                     }
                 }
                 Err(e) => mapping.warnings.push(format!("plugin {}: {e}", plugin.id)),
+            }
+        }
+        for rule in &self.hydrate {
+            let class = rule.class.trim();
+            let table = rule.table.trim();
+            // неполное правило пропускаем целиком
+            if class.is_empty() || table.is_empty() {
+                continue;
+            }
+            // `hydrate` дополняет уже найденное, но не перекрывает его
+            mapping
+                .tables
+                .entry(class.to_owned())
+                .or_insert_with(|| table.to_owned());
+            for (property, column) in &rule.properties {
+                let (property, column) = (property.trim(), column.trim());
+                if property.is_empty() || column.is_empty() {
+                    continue;
+                }
+                mapping.insert(class, property, table, column, "hydrate");
             }
         }
         for rule in &self.manual {
@@ -363,6 +407,8 @@ mod tests {
             name: name.into(),
             short: short_name(name).into(),
             extends: vec![],
+            implements: vec![],
+            traits: vec![],
             properties: props,
         }
     }
@@ -439,6 +485,7 @@ mod tests {
         let registry = Registry::from_config(Config {
             handlers: vec![],
             plugins: vec![],
+            hydrate: vec![],
             map: vec![MapRule {
                 class: "HotelChain".into(),
                 table: Some("cmn_hotel_chain".into()),
@@ -453,6 +500,126 @@ mod tests {
             .unwrap();
         assert_eq!(col.table, "cmn_hotel_chain");
         assert_eq!(col.handler, "manual");
+    }
+
+    #[test]
+    fn hydrate_rule_adds_table_and_columns() {
+        // класс не обязан быть в AST: объект заполняется JsonMapper / Serializer
+        let registry = Registry::from_config(Config {
+            hydrate: vec![HydrateRule {
+                class: "App\\Dto\\Hotel".into(),
+                table: "hotel".into(),
+                properties: BTreeMap::from([
+                    ("name".into(), "name".into()),
+                    ("nameEn".into(), "name_en".into()),
+                ]),
+            }],
+            ..Config::default()
+        });
+        let mapping = registry.apply(&[]);
+        assert_eq!(
+            mapping.tables.get("App\\Dto\\Hotel").map(String::as_str),
+            Some("hotel")
+        );
+        let col = mapping
+            .columns
+            .get(&("App\\Dto\\Hotel".to_string(), "nameEn".to_string()))
+            .expect("hydrate column");
+        assert_eq!(
+            (
+                col.table.as_str(),
+                col.column.as_str(),
+                col.handler.as_str()
+            ),
+            ("hotel", "name_en", "hydrate")
+        );
+    }
+
+    #[test]
+    fn hydrate_does_not_override_the_handler() {
+        let c = class(
+            "Common\\HotelChain",
+            vec![
+                prop("tableName", Value::Str("cmn_hotel_chain".into())),
+                prop(
+                    "fieldsMap",
+                    Value::Array(vec![(
+                        Some(Value::Str("nameEn".into())),
+                        Value::Str("name_en".into()),
+                    )]),
+                ),
+            ],
+        );
+        let registry = Registry::from_config(Config {
+            hydrate: vec![HydrateRule {
+                class: "Common\\HotelChain".into(),
+                table: "wrong".into(),
+                properties: BTreeMap::from([("nameEn".into(), "wrong".into())]),
+            }],
+            ..Config::default()
+        });
+        let mapping = registry.apply(&[c]);
+        let col = mapping
+            .columns
+            .get(&("Common\\HotelChain".to_string(), "nameEn".to_string()))
+            .expect("handler column");
+        assert_eq!(col.table, "cmn_hotel_chain");
+        assert_eq!(col.column, "name_en");
+        assert_eq!(col.handler, "legacy-fields-map");
+        assert_eq!(
+            mapping.tables.get("Common\\HotelChain").map(String::as_str),
+            Some("cmn_hotel_chain")
+        );
+    }
+
+    #[test]
+    fn manual_map_overrides_hydrate() {
+        let registry = Registry::from_config(Config {
+            hydrate: vec![HydrateRule {
+                class: "Common\\HotelChain".into(),
+                table: "wrong".into(),
+                properties: BTreeMap::from([("nameEn".into(), "wrong".into())]),
+            }],
+            map: vec![MapRule {
+                class: "HotelChain".into(),
+                table: Some("cmn_hotel_chain".into()),
+                property: Some("nameEn".into()),
+                column: Some("name_en".into()),
+            }],
+            ..Config::default()
+        });
+        let mapping = registry.apply(&[class("Common\\HotelChain", vec![])]);
+        let col = mapping
+            .columns
+            .get(&("Common\\HotelChain".to_string(), "nameEn".to_string()))
+            .expect("manual column");
+        assert_eq!(
+            (col.table.as_str(), col.column.as_str()),
+            ("cmn_hotel_chain", "name_en")
+        );
+        assert_eq!(col.handler, "manual");
+    }
+
+    #[test]
+    fn hydrate_rule_with_empty_class_or_table_is_skipped() {
+        let registry = Registry::from_config(Config {
+            hydrate: vec![
+                HydrateRule {
+                    class: "App\\EmptyTable".into(),
+                    table: "  ".into(),
+                    properties: BTreeMap::from([("p".into(), "c".into())]),
+                },
+                HydrateRule {
+                    class: "".into(),
+                    table: "t".into(),
+                    properties: BTreeMap::from([("p".into(), "c".into())]),
+                },
+            ],
+            ..Config::default()
+        });
+        let mapping = registry.apply(&[]);
+        assert!(mapping.tables.is_empty());
+        assert!(mapping.columns.is_empty());
     }
 
     #[test]

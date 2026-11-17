@@ -437,6 +437,7 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
                 self.loop_join(before);
             }
             Statement::Switch(node) => self.switch_statement(node),
+            Statement::Try(node) => self.try_statement(node),
             Statement::Return(node) => {
                 if let Some(value) = node.value {
                     let origins = self.origins(value);
@@ -555,6 +556,36 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
             None => before,
         };
         self.state = merged;
+    }
+
+    /// `try` / `catch` / `finally`: тело `try` с текущего состояния, каждое
+    /// `catch` — с копии состояния до `try` (исключение возможно до первого
+    /// оператора). Слияние: may — union, must — пересечение; `finally` — один
+    /// раз на слитом состоянии.
+    fn try_statement(&mut self, node: &Try<'a>) {
+        let before = self.state.clone();
+        self.statements(node.block.statements.as_slice());
+        let mut merged = self.state.clone();
+        for clause in node.catch_clauses.iter() {
+            self.state = before.clone();
+            if let Some(variable) = &clause.variable {
+                let name = lossy(variable.name);
+                self.set_var(&name, &["unknown".to_string()], &[]);
+                if let Some(ty) = hint_type(self.parsed, &self.resolver, &clause.hint) {
+                    self.state.types.insert(name, ty);
+                }
+            }
+            self.statements(clause.block.statements.as_slice());
+            let arm = self.state.clone();
+            merged = merge_states(merged, arm);
+        }
+        self.state = merged;
+        if let Some(finally) = &node.finally_clause {
+            let terminated = self.state.terminated;
+            self.state.terminated = false;
+            self.statements(finally.block.statements.as_slice());
+            self.state.terminated |= terminated;
+        }
     }
 
     /// Статически известное значение условия, если его можно решить.
@@ -691,6 +722,7 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
                     line,
                     lhs: name,
                     origins: origins.clone(),
+                    must: must_within(must, &origins),
                 });
             }
             Expression::Access(Access::Property(access)) => {
@@ -708,6 +740,7 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
                             line,
                             lhs: format!("prop:this::{name}"),
                             origins: origins.clone(),
+                            must: must_within(must, &origins),
                         });
                     }
                 } else if let Some(class) = self.type_of(access.object) {
@@ -715,6 +748,7 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
                         line,
                         lhs: format!("prop:{class}::{name}"),
                         origins: origins.clone(),
+                        must: must_within(must, &origins),
                     });
                 }
             }
@@ -729,6 +763,7 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
                         line,
                         lhs: format!("{base}[{text}]"),
                         origins: origins.clone(),
+                        must: Vec::new(),
                     });
                 }
             }
@@ -741,16 +776,79 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
                     line,
                     lhs: format!("{base}[]"),
                     origins: origins.clone(),
+                    must: Vec::new(),
                 });
+            }
+            Expression::List(list) => {
+                self.destructure(&list.elements, &origins, line);
+            }
+            Expression::Array(array) => {
+                self.destructure(&array.elements, &origins, line);
             }
             _ => {}
         }
         origins
     }
 
+    /// Деструктуризация `list(…)` / `[…]`: каждой привязанной переменной —
+    /// may правой части, must пуст (элемент не гарантирован). Ключи читаются
+    /// как обычные выражения.
+    fn destructure(
+        &mut self,
+        elements: &TokenSeparatedSequence<'a, ArrayElement<'a>>,
+        origins: &[String],
+        line: u32,
+    ) {
+        for element in elements.iter() {
+            match element {
+                ArrayElement::KeyValue(item) => {
+                    self.origins(item.key);
+                    self.destructure_value(item.value, origins, line);
+                }
+                ArrayElement::Value(item) => self.destructure_value(item.value, origins, line),
+                ArrayElement::Variadic(item) => self.destructure_value(item.value, origins, line),
+                ArrayElement::Missing(_) => {}
+            }
+        }
+    }
+
+    fn destructure_value(&mut self, value: &Expression<'a>, origins: &[String], line: u32) {
+        match value.unparenthesized() {
+            Expression::List(list) => self.destructure(&list.elements, origins, line),
+            Expression::Array(array) => self.destructure(&array.elements, origins, line),
+            _ => {
+                if let Some(name) = direct_var_name(value) {
+                    self.set_var(&name, origins, &[]);
+                    self.flow.assigns.push(Assign {
+                        line,
+                        lhs: name,
+                        origins: origins.to_vec(),
+                        must: Vec::new(),
+                    });
+                }
+            }
+        }
+    }
+
     // -- выражения ----------------------------------------------------------
 
     /// Истоки значения выражения (may); попутно пишет чтения и рёбра аргументов.
+    /// Истоки элементов массива-литерала (объединение значений; ключи не истоки).
+    fn array_origins(
+        &mut self,
+        elements: &TokenSeparatedSequence<'a, ArrayElement<'a>>,
+    ) -> Vec<String> {
+        let mut origins = Vec::new();
+        for element in elements.iter() {
+            match element {
+                ArrayElement::Value(value) => origins.extend(self.origins(value.value)),
+                ArrayElement::KeyValue(pair) => origins.extend(self.origins(pair.value)),
+                _ => {}
+            }
+        }
+        norm(origins)
+    }
+
     fn origins(&mut self, expression: &Expression<'a>) -> Vec<String> {
         match expression.unparenthesized() {
             Expression::Variable(Variable::Direct(variable)) => {
@@ -806,6 +904,7 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
             Expression::Call(call) => self.call(call, true),
             Expression::Instantiation(instantiation) => self.instantiation(instantiation),
             Expression::Assignment(assignment) => self.assignment(assignment),
+            Expression::Yield(node) => self.yield_expression(node),
             Expression::Binary(binary) => {
                 let mut origins = self.origins(binary.lhs);
                 origins.extend(self.origins(binary.rhs));
@@ -844,9 +943,9 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
             }
             Expression::Construct(_) => vec!["unknown".into()],
             Expression::CompositeString(_) => vec!["lit".into()],
-            Expression::Array(_) | Expression::LegacyArray(_) | Expression::List(_) => {
-                vec!["lit".into()]
-            }
+            Expression::Array(array) => self.array_origins(&array.elements),
+            Expression::LegacyArray(array) => self.array_origins(&array.elements),
+            Expression::List(_) => vec!["lit".into()],
             Expression::Closure(closure) => {
                 let before = self.state.clone();
                 self.closure_params(&closure.parameter_list);
@@ -895,10 +994,7 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
                 norm(must)
             }
             Expression::ArrayAppend(access) => self.origins_must(access.array),
-            Expression::Call(call) => self
-                .call_target(call)
-                .map(|target| vec![format!("c:{target}@{}", self.line_of(call))])
-                .unwrap_or_default(),
+            Expression::Call(call) => self.call_must(call),
             Expression::Instantiation(node) => self
                 .class_name(node.class)
                 .map(|class| vec![format!("new:{class}@{}", self.line_of(node))])
@@ -923,10 +1019,52 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
         }
     }
 
+    // -- генераторы ---------------------------------------------------------
+
+    /// `yield <expr>`, `yield <key> => <expr>`, `yield from <expr>`: значение
+    /// попадает в генератор, поэтому пишется в `returns` (для `c:@site`).
+    fn yield_expression(&mut self, node: &Yield<'a>) -> Vec<String> {
+        match node {
+            Yield::Value(value) => match value.value {
+                Some(expression) => self.yielded(expression),
+                None => vec!["unknown".into()],
+            },
+            Yield::Pair(pair) => {
+                self.origins(pair.key);
+                self.yielded(pair.value)
+            }
+            Yield::From(from) => self.yielded(from.iterator),
+        }
+    }
+
+    fn yielded(&mut self, expression: &Expression<'a>) -> Vec<String> {
+        let origins = self.origins(expression);
+        let must = self.origins_must(expression);
+        if significant(&origins) {
+            let origins = norm(origins);
+            let must = must_within(must, &origins);
+            self.flow.returns.push(Read {
+                line: self.line_of(expression),
+                expr: self.one_line(expression),
+                origins: origins.clone(),
+                must,
+            });
+            origins
+        } else {
+            origins
+        }
+    }
+
     // -- вызовы -------------------------------------------------------------
 
     /// Вызов: рёбра аргументов, исток `c:<target>@<line>` и (для значения) чтение.
     fn call(&mut self, call: &Call<'a>, used: bool) -> Vec<String> {
+        if let Some(origins) = self.array_column(call, used) {
+            return origins;
+        }
+        if let Some(origins) = self.call_user_func(call, used) {
+            return origins;
+        }
         let object = match call {
             Call::Method(node) => Some(node.object),
             Call::NullSafeMethod(node) => Some(node.object),
@@ -963,6 +1101,231 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
             }
             None => vec!["unknown".into()],
         }
+    }
+
+    /// `must`-исток вызова: для `array_column`/`call_user_func*` — тот же
+    /// атом, что и в `origins`, иначе обычный `c:<target>@<line>`.
+    fn call_must(&self, call: &Call<'a>) -> Vec<String> {
+        if let Some(name) = self.array_column_name(call) {
+            return vec![format!("key:{name}")];
+        }
+        if let Some(callee) = self.direct_callee(call) {
+            return vec![format!("c:{callee}@{}", self.line_of(call))];
+        }
+        self.call_target(call)
+            .map(|target| vec![format!("c:{target}@{}", self.line_of(call))])
+            .unwrap_or_default()
+    }
+
+    /// `array_column($rows, 'name_en')`: результат — значения колонки,
+    /// поэтому исток — `key:name_en`. Нелитеральная колонка — обычный вызов.
+    fn array_column(&mut self, call: &Call<'a>, used: bool) -> Option<Vec<String>> {
+        let name = self.array_column_name(call)?;
+        let line = self.line_of(call);
+        let target = self.call_target(call)?;
+        self.arguments(call.get_argument_list(), Some(&target), line);
+        let origins = vec![format!("key:{name}")];
+        if used {
+            self.record_read(call, origins.clone(), origins.clone());
+        }
+        Some(origins)
+    }
+
+    fn array_column_name(&self, call: &Call<'a>) -> Option<String> {
+        let target = self.call_target(call)?;
+        if !target.eq_ignore_ascii_case("array_column") {
+            return None;
+        }
+        let argument = positional_values(call.get_argument_list())
+            .into_iter()
+            .nth(1)?;
+        match argument.unparenthesized() {
+            Expression::Literal(Literal::String(string)) => {
+                Some(string.value.map(lossy).unwrap_or_else(|| lossy(string.raw)))
+            }
+            _ => None,
+        }
+    }
+
+    /// `call_user_func` / `call_user_func_array` со статически известной
+    /// вызываемой целью: настоящий `c:<target>@<line>` и рёбра остальных
+    /// аргументов (индексы с 0, сама цель не считается аргументом).
+    fn call_user_func(&mut self, call: &Call<'a>, used: bool) -> Option<Vec<String>> {
+        let callee = self.direct_callee(call)?;
+        let name = self.call_target(call)?;
+        let short = name
+            .rsplit('\\')
+            .next()
+            .unwrap_or(&name)
+            .to_ascii_lowercase();
+        let line = self.line_of(call);
+        let arguments = positional_values(call.get_argument_list());
+        if short == "call_user_func_array" {
+            let array = *arguments.get(1)?;
+            self.array_arguments(array, &callee, line)?;
+        } else {
+            for (index, argument) in arguments.iter().skip(1).enumerate() {
+                let origins = self.origins(argument);
+                let must = self.origins_must(argument);
+                self.flow.args.push(ArgEdge {
+                    line,
+                    target: callee.clone(),
+                    index,
+                    origins: norm(origins),
+                    must: norm(must),
+                });
+            }
+        }
+        let origins = vec![format!("c:{callee}@{line}")];
+        if used {
+            self.record_read(call, origins.clone(), origins.clone());
+        }
+        Some(origins)
+    }
+
+    /// Цель `call_user_func*`, если она известна статически (иначе `None` —
+    /// остаётся динамическое поведение).
+    fn direct_callee(&self, call: &Call<'a>) -> Option<String> {
+        let Call::Function(_) = call else {
+            return None;
+        };
+        let name = self.call_target(call)?;
+        let short = name.rsplit('\\').next().unwrap_or(&name);
+        let arguments = positional_values(call.get_argument_list());
+        let callable = *arguments.first()?;
+        if short.eq_ignore_ascii_case("call_user_func") {
+            return self.callable_target(callable);
+        }
+        if short.eq_ignore_ascii_case("call_user_func_array") {
+            let array = arguments.get(1)?;
+            if matches!(
+                array.unparenthesized(),
+                Expression::Array(_) | Expression::LegacyArray(_)
+            ) {
+                return self.callable_target(callable);
+            }
+        }
+        None
+    }
+
+    /// Разобрать статически известную вызываемую цель: `[$this, 'm']`,
+    /// `[Foo::class, 'm']`, `'Foo::bar'`, `'func'`, `$this->m(...)`.
+    fn callable_target(&self, expression: &Expression<'a>) -> Option<String> {
+        match expression.unparenthesized() {
+            Expression::Literal(Literal::String(string)) => {
+                let name = string.value.map(lossy).unwrap_or_else(|| lossy(string.raw));
+                let name = name.trim().trim_start_matches('\\');
+                match name.split_once("::") {
+                    Some((class, method)) => {
+                        let class = self.resolver.resolve_class(class.trim());
+                        Some(format!("{class}::{method}"))
+                    }
+                    None if !name.is_empty() => Some(name.to_string()),
+                    None => None,
+                }
+            }
+            Expression::Array(array) => self.callable_pair(&array.elements),
+            Expression::LegacyArray(array) => self.callable_pair(&array.elements),
+            Expression::PartialApplication(PartialApplication::Function(node)) => {
+                match node.function.unparenthesized() {
+                    Expression::Identifier(identifier) => Some(
+                        lossy(identifier.value())
+                            .trim_start_matches('\\')
+                            .to_string(),
+                    ),
+                    _ => None,
+                }
+            }
+            Expression::PartialApplication(PartialApplication::Method(node)) => {
+                let ClassLikeMemberSelector::Identifier(method) = &node.method else {
+                    return None;
+                };
+                let class = if is_this(node.object) {
+                    self.class.clone()?
+                } else {
+                    self.type_of(node.object)?
+                };
+                Some(format!("{class}::{}", lossy(method.value)))
+            }
+            Expression::PartialApplication(PartialApplication::StaticMethod(node)) => {
+                let ClassLikeMemberSelector::Identifier(method) = &node.method else {
+                    return None;
+                };
+                let class = self.class_name(node.class)?;
+                Some(format!("{class}::{}", lossy(method.value)))
+            }
+            _ => None,
+        }
+    }
+
+    /// Пара `[получатель, 'метод']` из литерала массива.
+    fn callable_pair(
+        &self,
+        elements: &TokenSeparatedSequence<'a, ArrayElement<'a>>,
+    ) -> Option<String> {
+        let receiver = elements.first()?.get_value()?;
+        let method = elements.get(1)?.get_value()?;
+        let Expression::Literal(Literal::String(method)) = method.unparenthesized() else {
+            return None;
+        };
+        let method = method.value.map(lossy).unwrap_or_else(|| lossy(method.raw));
+        let class = match receiver.unparenthesized() {
+            Expression::Literal(Literal::String(class)) => class
+                .value
+                .map(lossy)
+                .unwrap_or_else(|| lossy(class.raw))
+                .trim_start_matches('\\')
+                .to_string(),
+            Expression::Access(Access::ClassConstant(access)) => {
+                let ClassLikeConstantSelector::Identifier(name) = &access.constant else {
+                    return None;
+                };
+                if !lossy(name.value).eq_ignore_ascii_case("class") {
+                    return None;
+                }
+                self.class_name(access.class)?
+            }
+            _ if is_this(receiver) => self.class.clone()?,
+            _ => self.type_of(receiver)?,
+        };
+        Some(format!("{class}::{method}"))
+    }
+
+    /// Аргументы из литерала массива: индексы по порядку элементов.
+    fn array_arguments(
+        &mut self,
+        expression: &Expression<'a>,
+        target: &str,
+        line: u32,
+    ) -> Option<()> {
+        let elements = match expression.unparenthesized() {
+            Expression::Array(array) => &array.elements,
+            Expression::LegacyArray(array) => &array.elements,
+            _ => return None,
+        };
+        let mut index = 0;
+        for element in elements.iter() {
+            let value = match element {
+                ArrayElement::KeyValue(item) => {
+                    self.origins(item.key);
+                    item.value
+                }
+                ArrayElement::Value(item) => item.value,
+                ArrayElement::Variadic(item) => item.value,
+                ArrayElement::Missing(_) => continue,
+            };
+            let origins = self.origins(value);
+            let must = self.origins_must(value);
+            self.flow.args.push(ArgEdge {
+                line,
+                target: target.to_string(),
+                index,
+                origins: norm(origins),
+                must: norm(must),
+            });
+            index += 1;
+        }
+        Some(())
     }
 
     fn instantiation(&mut self, node: &Instantiation<'a>) -> Vec<String> {
@@ -1143,7 +1506,8 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
                 self.flow.assigns.push(Assign {
                     line: self.line_of(parameter),
                     lhs: format!("prop:this::{property}"),
-                    origins: vec![atom],
+                    origins: vec![atom.clone()],
+                    must: vec![atom],
                 });
                 if let Some(ty) = ty {
                     self.state.types.insert(format!("this->{property}"), ty);
@@ -1298,6 +1662,17 @@ fn direct_var_name(expression: &Expression<'_>) -> Option<String> {
         Expression::Variable(Variable::Direct(variable)) => Some(lossy(variable.name)),
         _ => None,
     }
+}
+
+/// Позиционные значения аргументов вызова.
+fn positional_values<'a>(list: &ArgumentList<'a>) -> Vec<&'a Expression<'a>> {
+    list.arguments
+        .iter()
+        .filter_map(|argument| match argument {
+            Argument::Positional(argument) => Some(argument.value),
+            Argument::Named(_) => None,
+        })
+        .collect()
 }
 
 /// Есть ли в наборе атом, который стоит показывать в выдаче.
@@ -2221,5 +2596,247 @@ function makeItem(): Item
         assert_eq!(types.get("Repo::all").map(String::as_str), Some("Item"));
         assert_eq!(types.get("Repo::selfRef").map(String::as_str), Some("Repo"));
         assert_eq!(types.get("makeItem").map(String::as_str), Some("Item"));
+    }
+
+    #[test]
+    fn try_catch_and_finally_bodies_feed_reads() {
+        let source = r#"<?php
+class C
+{
+    public function run($row, $c): void
+    {
+        try {
+            $x = 'lit';
+        } catch (\RuntimeException $e) {
+            $x = $row['name_en'];
+        } finally {
+            $z = $row['id'];
+        }
+        if ($x) {
+        }
+        if ($z) {
+        }
+    }
+}
+"#;
+        let files = facts(source);
+        let run = method(&files, "C::run");
+        let x = run
+            .reads
+            .iter()
+            .find(|read| read.expr == "$x")
+            .expect("нет чтения $x");
+        assert!(
+            x.origins.iter().any(|atom| atom == "key:name_en"),
+            "{:?}",
+            x.origins
+        );
+        assert!(x.must.is_empty(), "{:?}", x.must);
+        let z = run
+            .reads
+            .iter()
+            .find(|read| read.expr == "$z")
+            .expect("нет чтения $z");
+        assert!(
+            z.origins.iter().any(|atom| atom == "key:id"),
+            "{:?}",
+            z.origins
+        );
+    }
+
+    #[test]
+    fn destructuring_binds_variables_to_rhs_origins() {
+        let source = r#"<?php
+function run($row)
+{
+    $data = $row['name_en'];
+    list($a, ['k' => [$b]]) = $data;
+    [$c] = $data;
+    if ($a) {
+    }
+}
+"#;
+        let files = facts(source);
+        let run = method(&files, "run");
+        for name in ["$a", "$b", "$c"] {
+            let assign = run
+                .assigns
+                .iter()
+                .find(|assign| assign.lhs == name)
+                .unwrap_or_else(|| panic!("нет присваивания {name}"));
+            assert!(
+                assign.origins.iter().any(|atom| atom == "key:name_en"),
+                "{name}: {:?}",
+                assign.origins
+            );
+            assert!(assign.must.is_empty(), "{name}: {:?}", assign.must);
+        }
+        let read = run
+            .reads
+            .iter()
+            .find(|read| read.expr == "$a")
+            .expect("нет чтения $a");
+        assert!(
+            read.origins.iter().any(|atom| atom == "key:name_en"),
+            "{:?}",
+            read.origins
+        );
+    }
+
+    #[test]
+    fn yield_adds_generator_returns() {
+        let source = r#"<?php
+function each($rows, $more)
+{
+    foreach ($rows as $row) {
+        yield $row['x'];
+    }
+    yield 'k' => $more['y'];
+    yield from $more['z'];
+}
+"#;
+        let files = facts(source);
+        let each = method(&files, "each");
+        for key in ["key:x", "key:y", "key:z"] {
+            assert!(
+                each.returns
+                    .iter()
+                    .any(|ret| ret.origins.iter().any(|atom| atom == key)),
+                "{key}: {:?}",
+                each.returns
+            );
+        }
+    }
+
+    #[test]
+    fn array_column_literal_returns_key_origin() {
+        let source = r#"<?php
+function names($rows)
+{
+    $names = array_column($rows, 'name_en');
+    if ($names) {
+    }
+}
+"#;
+        let files = facts(source);
+        let names = method(&files, "names");
+        let assign = names
+            .assigns
+            .iter()
+            .find(|assign| assign.lhs == "$names")
+            .expect("нет присваивания $names");
+        assert_eq!(assign.origins, vec!["key:name_en".to_string()]);
+        let read = names
+            .reads
+            .iter()
+            .find(|read| read.expr == "$names")
+            .expect("нет чтения $names");
+        assert!(
+            read.origins.iter().any(|atom| atom == "key:name_en"),
+            "{:?}",
+            read.origins
+        );
+        assert!(
+            names.args.iter().any(|edge| edge.target == "array_column"
+                && edge.index == 0
+                && edge.origins.iter().any(|atom| atom == "p:names#0")),
+            "{:?}",
+            names.args
+        );
+        assert!(
+            names
+                .args
+                .iter()
+                .any(|edge| edge.target == "array_column" && edge.index == 1),
+            "{:?}",
+            names.args
+        );
+    }
+
+    #[test]
+    fn call_user_func_static_callable_emits_real_target() {
+        let source = r#"<?php
+class C
+{
+    public function m($v): void
+    {
+    }
+
+    public function bar($v): void
+    {
+    }
+
+    public function run($row): void
+    {
+        $x = call_user_func([$this, 'm'], $row['x']);
+        $y = call_user_func_array([$this, 'm'], [$row['y']]);
+        $z = call_user_func('C::bar', $row['z']);
+        $w = call_user_func($this->m(...), $row['w']);
+    }
+}
+"#;
+        let files = facts(source);
+        let run = method(&files, "C::run");
+        let x = run
+            .assigns
+            .iter()
+            .find(|assign| assign.lhs == "$x")
+            .expect("нет присваивания $x");
+        assert_eq!(x.origins, vec!["c:C::m@14".to_string()]);
+        let edge = run
+            .args
+            .iter()
+            .find(|edge| edge.target == "C::m" && edge.line == 14 && edge.index == 0)
+            .expect("нет аргумента C::m");
+        assert!(
+            edge.origins.iter().any(|atom| atom == "key:x"),
+            "{:?}",
+            edge.origins
+        );
+        let y = run
+            .assigns
+            .iter()
+            .find(|assign| assign.lhs == "$y")
+            .expect("нет присваивания $y");
+        assert_eq!(y.origins, vec!["c:C::m@15".to_string()]);
+        let array_edge = run
+            .args
+            .iter()
+            .find(|edge| edge.target == "C::m" && edge.line == 15 && edge.index == 0)
+            .expect("нет аргумента C::m из call_user_func_array");
+        assert!(
+            array_edge.origins.iter().any(|atom| atom == "key:y"),
+            "{:?}",
+            array_edge.origins
+        );
+        let z = run
+            .assigns
+            .iter()
+            .find(|assign| assign.lhs == "$z")
+            .expect("нет присваивания $z");
+        assert_eq!(z.origins, vec!["c:C::bar@16".to_string()]);
+        let w = run
+            .assigns
+            .iter()
+            .find(|assign| assign.lhs == "$w")
+            .expect("нет присваивания $w");
+        assert_eq!(w.origins, vec!["c:C::m@17".to_string()]);
+        let partial_edge = run
+            .args
+            .iter()
+            .find(|edge| edge.target == "C::m" && edge.line == 17 && edge.index == 0)
+            .expect("нет аргумента C::m из first-class callable");
+        assert!(
+            partial_edge.origins.iter().any(|atom| atom == "key:w"),
+            "{:?}",
+            partial_edge.origins
+        );
+        assert!(
+            run.args.iter().all(
+                |edge| edge.target != "call_user_func" && edge.target != "call_user_func_array"
+            ),
+            "{:?}",
+            run.args
+        );
     }
 }

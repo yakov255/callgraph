@@ -85,6 +85,12 @@ pub struct Index {
     reads: Vec<ReadFact>,
     /// Прямые родители: класс → полные имена родителей.
     parents: HashMap<String, Vec<String>>,
+    /// Обратная карта: класс → прямые потомки (реализации интерфейсов/трейтов).
+    children: HashMap<String, Vec<String>>,
+    /// `must`-истоки property по `lhs`; повторные записи сужают пересечением.
+    prop_must: HashMap<String, BTreeSet<String>>,
+    /// Сопоставление `(класс, property) → (таблица, колонка)`.
+    mapping: HashMap<(String, String), (String, String)>,
     /// Транзитивное раскрытие каждого встреченного атома.
     expanded: HashMap<String, BTreeSet<String>>,
     /// Кэш раскрытия с контекстом получателя: (атом, контекст, глубина) → множество.
@@ -104,6 +110,19 @@ impl Index {
             parents: parents.clone(),
             ..Self::default()
         };
+        for (class, direct) in parents {
+            for parent in direct {
+                index
+                    .children
+                    .entry(parent.clone())
+                    .or_default()
+                    .push(class.clone());
+            }
+        }
+        for children in index.children.values_mut() {
+            children.sort();
+            children.dedup();
+        }
         for file in files {
             for method in &file.methods {
                 let container = method.container.as_deref();
@@ -139,6 +158,13 @@ impl Index {
                             .iter()
                             .map(|origin| qualify(origin, &file.file, container))
                             .collect();
+                        // `must` property: повторная запись сужает гарантию; пустая — снимает.
+                        let must: BTreeSet<String> = assign
+                            .must
+                            .iter()
+                            .map(|origin| qualify(origin, &file.file, container))
+                            .collect();
+                        must_merge(&mut index.prop_must, lhs.clone(), must);
                         if lhs.starts_with("prop:this:") {
                             if is_constructor(&method.id) {
                                 index
@@ -229,6 +255,25 @@ impl Index {
         index
     }
 
+    /// Добавить сопоставление `(класс, property) → (таблица, колонка)`: раскрытие property
+    /// получает терминальный атом `sql:<table>.<column>`. Раскрытие пересчитывается.
+    pub fn with_mapping(mut self, mapping: &crate::flow::Mapping) -> Self {
+        self.mapping = mapping
+            .columns
+            .iter()
+            .map(|((class, property), column)| {
+                (
+                    (class.clone(), property.clone()),
+                    (column.table.clone(), column.column.clone()),
+                )
+            })
+            .collect();
+        self.expanded.clear();
+        self.ctx_expanded.borrow_mut().clear();
+        self.fixpoint();
+        self
+    }
+
     /// Цепочки, в которых встречается `term` (ключ/колонка/property).
     pub fn traces(&self, term: &str) -> Vec<Trace> {
         let term = normalize_term(term);
@@ -244,7 +289,10 @@ impl Index {
                 continue;
             };
             // Колонка — сам совпавший атом; для совпадения по последнему сегменту — голый терм.
-            let column = if matched.starts_with("key:") || matched.starts_with("prop:") {
+            let column = if matched.starts_with("key:")
+                || matched.starts_with("prop:")
+                || matched.starts_with("sql:")
+            {
                 matched.clone()
             } else {
                 term.clone()
@@ -286,10 +334,10 @@ impl Index {
     fn direct_ctx(&self, atom: &str, ctx: &BTreeSet<String>) -> BTreeSet<String> {
         if let Some(rest) = atom.strip_prefix("c:")
             && let (target, Some(site)) = split_call(rest)
-            && let Some(origins) = self.returns_for_target(target)
+            && let Some(origins) = self.returns_for_call(target)
         {
             let mut set = BTreeSet::new();
-            for origin in origins {
+            for origin in &origins {
                 if is_this_property(origin) {
                     set.extend(self.receiver_property(target, site, origin, ctx));
                     continue;
@@ -353,7 +401,7 @@ impl Index {
             }
             return;
         };
-        let Some(origins) = self.returns_for_target(target) else {
+        let Some(origins) = self.returns_for_call(target) else {
             return;
         };
         let allocations = self.site_allocations(target, site, ctx);
@@ -361,7 +409,7 @@ impl Index {
             .iter()
             .map(|(class, allocation_site)| format!("new:{class}@{allocation_site}"))
             .collect();
-        for origin in origins {
+        for origin in &origins {
             if is_this_property(origin) {
                 if allocations.is_empty() {
                     set.extend(self.expand_closure(origin, ctx, depth));
@@ -401,22 +449,30 @@ impl Index {
             && property.starts_with("prop:")
             && let Some((class, Some(site))) = parse_new(allocation)
         {
-            return self.allocation_property(property, class, site);
+            let mut set = self.allocation_property(property, class, site);
+            if let Some(sql) = self.mapping_sql(property) {
+                set.insert(sql);
+            }
+            return set;
         }
         if atom.starts_with("prop:") {
-            return self.assigns.get(atom).cloned().unwrap_or_default();
+            let mut set = self.assigns.get(atom).cloned().unwrap_or_default();
+            if let Some(sql) = self.mapping_sql(atom) {
+                set.insert(sql);
+            }
+            return set;
         }
         if let Some(rest) = atom.strip_prefix("c:") {
             let (target, site) = split_call(rest);
-            let Some(origins) = self.returns_for_target(target) else {
+            let Some(origins) = self.returns_for_call(target) else {
                 return BTreeSet::new();
             };
             let Some(site) = site else {
                 // Голый `c:<method>`: текущее глобальное раскрытие.
-                return origins.clone();
+                return origins;
             };
             let mut set = BTreeSet::new();
-            for origin in origins {
+            for origin in &origins {
                 if let Some((param_target, index)) = parse_param(origin)
                     && same_method(param_target, target)
                 {
@@ -546,23 +602,49 @@ impl Index {
     /// Записи свойства, раскрытые аргументами конструктора этого места создания, плюс записи
     /// сеттеров, чей вызов получателем указывает на это место создания.
     fn allocation_property(&self, property: &str, class: &str, site: &str) -> BTreeSet<String> {
+        let property = self.receiver_property_atom(property, class);
         let mut set = BTreeSet::new();
         // Конструкторы привязаны к месту создания; прочие `$this->p` — через `setter_writes`.
         let writes = if property.starts_with("prop:this:") {
-            self.ctor_writes.get(property).cloned().unwrap_or_default()
+            self.ctor_writes.get(&property).cloned().unwrap_or_default()
         } else {
-            self.property_writes(property)
+            self.property_writes(&property)
         };
         for write in writes {
             set.extend(self.expand_allocation(&write, class, site, 0));
         }
         if let Some(extra) =
             self.setter_writes
-                .get(&(property.to_string(), class.to_string(), site.to_string()))
+                .get(&(property.clone(), class.to_string(), site.to_string()))
         {
             set.extend(extra.iter().cloned());
         }
         set
+    }
+
+    /// Trait-метод читает `$this->p` как `prop:this:<Trait>::p`, а запись живёт в классе,
+    /// который использует trait. Если у получателя есть одноимённое свойство — берём его атом.
+    fn receiver_property_atom(&self, property: &str, class: &str) -> String {
+        let Some((prefix, name)) = property.rsplit_once("::") else {
+            return property.to_owned();
+        };
+        if !prefix.starts_with("prop:this:") {
+            return property.to_owned();
+        }
+        let candidate = format!("prop:this:{class}::{name}");
+        let has = self
+            .ctor_writes
+            .get(&candidate)
+            .is_some_and(|writes| !writes.is_empty())
+            || self
+                .assigns
+                .get(&candidate)
+                .is_some_and(|writes| !writes.is_empty())
+            || self
+                .prop_must
+                .get(&candidate)
+                .is_some_and(|writes| !writes.is_empty());
+        if has { candidate } else { property.to_owned() }
     }
 
     /// Записи `$this->p` из методов-сеттеров, привязанные к месту создания: вызов сеттера
@@ -648,6 +730,112 @@ impl Index {
             Some((class, method)) => self.returns_for(class, method),
             None => self.returns.get(target),
         }
+    }
+
+    /// Истоки возвратов с диспетчеризацией: точный id и родители первыми (точнее),
+    /// затем потомки интерфейса/трейта — объединение возвратов реализаций.
+    fn returns_for_call(&self, target: &str) -> Option<BTreeSet<String>> {
+        if let Some(set) = self.returns_for_target(target) {
+            return Some(set.clone());
+        }
+        let (class, method) = target.rsplit_once("::")?;
+        let mut set = BTreeSet::new();
+        for id in self.descendant_method_ids(class, method) {
+            if let Some(origins) = self.returns.get(&id) {
+                set.extend(origins.iter().cloned());
+            }
+        }
+        (!set.is_empty()).then_some(set)
+    }
+
+    /// `must`-возвраты с диспетчеризацией: пересечение реализаций потомков.
+    fn returns_must_for_call(&self, target: &str) -> Option<BTreeSet<String>> {
+        if let Some(set) = self.returns_must_for_target(target) {
+            return Some(set.clone());
+        }
+        let (class, method) = target.rsplit_once("::")?;
+        self.descendant_returns_must(class, method)
+    }
+
+    /// Транзитивные потомки `class`, определяющие `<Child>::<method>` (точный id).
+    fn descendant_method_ids(&self, class: &str, method: &str) -> Vec<String> {
+        let mut ids = Vec::new();
+        let mut queue = VecDeque::new();
+        let mut visited = BTreeSet::new();
+        visited.insert(class.to_string());
+        queue.push_back(class.to_string());
+        while let Some(current) = queue.pop_front() {
+            let Some(children) = self.children.get(&current) else {
+                continue;
+            };
+            for child in children {
+                if !visited.insert(child.clone()) {
+                    continue;
+                }
+                let id = format!("{child}::{method}");
+                if self.returns.contains_key(&id) {
+                    ids.push(id);
+                }
+                queue.push_back(child.clone());
+            }
+        }
+        ids
+    }
+
+    /// `must`-гарантия реализаций: атом остаётся, только если он есть у каждой.
+    fn descendant_returns_must(&self, class: &str, method: &str) -> Option<BTreeSet<String>> {
+        let ids = self.descendant_method_ids(class, method);
+        if ids.is_empty() {
+            return None;
+        }
+        let mut result: Option<BTreeSet<String>> = None;
+        for id in ids {
+            let set = self.returns_must.get(&id).cloned().unwrap_or_default();
+            result = Some(match result {
+                Some(previous) => must_intersect(&previous, &set),
+                None => set,
+            });
+        }
+        result
+    }
+
+    /// Терминальный `sql:<table>.<column>` для property, если сопоставление знает пару.
+    fn mapping_sql(&self, property: &str) -> Option<String> {
+        let rest = property.strip_prefix("prop:")?;
+        let rest = rest.strip_prefix("this:").unwrap_or(rest);
+        let (class, name) = rest.split_once("::")?;
+        let (table, column) = self
+            .mapping
+            .get(&(class.to_string(), name.to_string()))
+            .or_else(|| {
+                let bare = name.strip_prefix('$')?;
+                self.mapping.get(&(class.to_string(), bare.to_string()))
+            })?;
+        Some(format!("sql:{table}.{column}"))
+    }
+
+    /// `must` property: для места создания — записи конструктора с подстановкой аргументов;
+    /// иначе — `prop_must`. Плюс терминальный `sql:`-атом по сопоставлению.
+    fn must_property(&self, atom: &str, depth: usize) -> BTreeSet<String> {
+        if let Some((property, allocation)) = atom.split_once('@')
+            && property.starts_with("prop:")
+            && let Some((class, Some(site))) = parse_new(allocation)
+        {
+            let property = self.receiver_property_atom(property, class);
+            let mut set = BTreeSet::new();
+            for origin in self.prop_must.get(&property).cloned().unwrap_or_default() {
+                set.extend(self.expand_allocation(&origin, class, site, depth + 1));
+            }
+            if let Some(sql) = self.mapping_sql(&property) {
+                set.insert(sql);
+            }
+            return set;
+        }
+        let mut set = self.prop_must.get(atom).cloned().unwrap_or_default();
+        if let Some(sql) = self.mapping_sql(atom) {
+            set.insert(sql);
+        }
+        set
     }
 
     /// Аргументы сайта `(цель, сайт, индекс)`; отсутствие — вызов без аргументов на этом сайте.
@@ -789,9 +977,12 @@ impl Index {
         if depth >= MUST_DEPTH {
             return set;
         }
-        // Записи property и `this` не несут `must`-данных.
-        if atom.starts_with("prop:") || atom == "this" {
+        // `this` не несёт `must`-данных; property — через `prop_must`.
+        if atom == "this" {
             return set;
+        }
+        if atom.starts_with("prop:") {
+            return self.must_property(atom, depth);
         }
         // Терминальные атомы: исток сам по себе.
         if atom.starts_with("key:")
@@ -814,10 +1005,10 @@ impl Index {
             return set;
         };
         let (target, site) = split_call(rest);
-        let Some(origins) = self.returns_must_for_target(target) else {
+        let Some(origins) = self.returns_must_for_call(target) else {
             return set;
         };
-        for origin in origins {
+        for origin in &origins {
             if let Some((param_target, index)) = parse_param(origin) {
                 // Параметр своего вызова — аргументы именно этого сайта, иначе глобальные.
                 let args = site
@@ -1119,6 +1310,7 @@ fn match_atom(
     key_atom: &str,
     prop_suffix: &str,
 ) -> Option<String> {
+    let qualified = term.matches('.').count() == 1;
     let mut prop = None;
     let mut bare = None;
     for atom in set {
@@ -1127,6 +1319,18 @@ fn match_atom(
         }
         if atom == key_atom {
             return Some(atom.clone());
+        }
+        if let Some(value) = atom.strip_prefix("sql:") {
+            // Квалифицированный терм `<table>.<column>` — точное совпадение без учёта регистра;
+            // иначе — совпадение по имени колонки (последний сегмент).
+            if qualified {
+                if value.eq_ignore_ascii_case(term) {
+                    return Some(atom.clone());
+                }
+            } else if last_segment(atom) == term {
+                bare.get_or_insert_with(|| atom.clone());
+            }
+            continue;
         }
         if atom.starts_with("prop:") && atom.ends_with(prop_suffix) {
             prop.get_or_insert_with(|| atom.clone());
@@ -1186,6 +1390,16 @@ mod tests {
             line,
             lhs: lhs.into(),
             origins: origins.iter().map(|origin| (*origin).to_string()).collect(),
+            must: Vec::new(),
+        }
+    }
+
+    fn assign_must(line: u32, lhs: &str, origins: &[&str], must: &[&str]) -> Assign {
+        Assign {
+            line,
+            lhs: lhs.into(),
+            origins: origins.iter().map(|origin| (*origin).to_string()).collect(),
+            must: must.iter().map(|origin| (*origin).to_string()).collect(),
         }
     }
 
@@ -1773,5 +1987,119 @@ mod tests {
         let traces = index.traces("id");
         assert_eq!(traces.len(), 1, "{traces:#?}");
         assert!(traces[0].must);
+    }
+
+    /// Интерфейс: возвраты реализаций объединяются (may), гарантии нет (`must` = false).
+    #[test]
+    fn interface_dispatch_unions_implementations() {
+        let mut first = method("AImpl::get");
+        first
+            .returns
+            .push(read(2, "$row['name_en']", &["key:name_en"]));
+        let mut second = method("BImpl::get");
+        second.returns.push(read(2, "$row['id']", &["key:id"]));
+        let mut run = method("Svc::run");
+        run.reads.push(read(9, "$i->get()", &["c:IFace::get"]));
+        let mut parents = HashMap::new();
+        parents.insert("AImpl".to_string(), vec!["IFace".to_string()]);
+        parents.insert("BImpl".to_string(), vec!["IFace".to_string()]);
+        let index = Index::build_with_parents(&[file("a.php", vec![first, second, run])], &parents);
+
+        let traces = index.traces("name_en");
+        assert_eq!(traces.len(), 1, "{traces:#?}");
+        assert!(!traces[0].must);
+        assert!(has(&traces[0], "c:IFace::get") && has(&traces[0], "key:name_en"));
+    }
+
+    /// Трейт: метод резолвится в реализацию потомка.
+    #[test]
+    fn trait_method_resolves_through_descendants() {
+        let mut label = method("Item::label");
+        label
+            .returns
+            .push(read(3, "$this->label", &["key:name_en"]));
+        let mut run = method("Svc::run");
+        run.reads
+            .push(read(9, "$x->label()", &["c:HasName::label"]));
+        let mut parents = HashMap::new();
+        parents.insert("Item".to_string(), vec!["HasName".to_string()]);
+        let index = Index::build_with_parents(&[file("a.php", vec![label, run])], &parents);
+
+        let traces = index.traces("name_en");
+        assert_eq!(traces.len(), 1, "{traces:#?}");
+        assert!(has(&traces[0], "c:HasName::label"));
+    }
+
+    /// Property всегда пишется с колонкой — чтение через геттер становится `must`.
+    #[test]
+    fn property_must_through_a_getter() {
+        let mut ctor = method("Item::__construct");
+        ctor.container = Some("Item".into());
+        ctor.assigns.push(assign_must(
+            3,
+            "prop:this::name",
+            &["key:name_en"],
+            &["key:name_en"],
+        ));
+        let mut getter = method("Item::getName");
+        getter.container = Some("Item".into());
+        getter.returns.push(read_must(
+            7,
+            "$this->name",
+            &["prop:this::name"],
+            &["prop:this::name"],
+        ));
+        let mut run = method("A::run");
+        run.reads.push(read_must(
+            11,
+            "$item->getName()",
+            &["c:Item::getName"],
+            &["c:Item::getName"],
+        ));
+        let index = Index::build(&[file("a.php", vec![ctor, getter, run])]);
+
+        let traces = index.traces("name_en");
+        assert_eq!(traces.len(), 1, "{traces:#?}");
+        assert!(traces[0].must);
+    }
+
+    fn mapping_index() -> Index {
+        let mut init = method("Item::init");
+        init.container = Some("Item".into());
+        init.assigns
+            .push(assign(4, "prop:this::name", &["unknown"]));
+        let mut getter = method("Item::getName");
+        getter.container = Some("Item".into());
+        getter
+            .returns
+            .push(read(7, "$this->name", &["prop:this::name"]));
+        let mut run = method("A::run");
+        run.reads
+            .push(read(11, "$item->getName()", &["c:Item::getName"]));
+        let mut mapping = crate::flow::Mapping::default();
+        mapping.insert("Item", "name", "items", "name_en", "test");
+        Index::build(&[file("a.php", vec![init, getter, run])]).with_mapping(&mapping)
+    }
+
+    /// Сопоставление добавляет терминальный `sql:<table>.<column>` к раскрытию property.
+    #[test]
+    fn mapping_adds_the_sql_atom() {
+        let index = mapping_index();
+        let traces = index.traces("items.name_en");
+        assert_eq!(traces.len(), 1, "{traces:#?}");
+        assert_eq!(traces[0].column, "sql:items.name_en");
+        assert!(has(&traces[0], "sql:items.name_en"));
+    }
+
+    /// Квалифицированный терм `<table>.<column>` сравнивается без учёта регистра;
+    /// без таблицы — совпадение по имени колонки.
+    #[test]
+    fn table_qualified_term_matches_sql_atom() {
+        let index = mapping_index();
+        assert_eq!(index.traces("ITEMS.NAME_EN").len(), 1);
+        assert!(index.traces("other.name_en").is_empty());
+        let traces = index.traces("name_en");
+        assert_eq!(traces.len(), 1, "{traces:#?}");
+        assert_eq!(traces[0].column, "sql:items.name_en");
     }
 }

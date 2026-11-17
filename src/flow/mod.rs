@@ -71,6 +71,9 @@ pub fn scan_flow(root: &Path) -> Result<Vec<FlowFile>> {
 }
 
 /// Карта «класс → прямые родители» из фактов о классах (для наследования методов в `Index`).
+///
+/// Прямые родители — объединение `extends`, `implements` и `traits` без повторов, полные имена.
+/// Транзитивные предки не разворачиваются: `Index` сам обходит цепочку в ширину.
 pub fn scan_parents(root: &Path) -> Result<HashMap<String, Vec<String>>> {
     let walker = FileWalker::for_extensions(vec!["php"]);
     let files = walker.collect(&[root.to_path_buf()], &mut |_| {});
@@ -85,11 +88,35 @@ pub fn scan_parents(root: &Path) -> Result<HashMap<String, Vec<String>>> {
         .collect();
     Ok(classes
         .into_iter()
-        .map(|class| (class.name, class.extends))
+        .map(|class| {
+            let parents = direct_parents(&class);
+            (class.name, parents)
+        })
         .collect())
 }
 
-/// Property родителей и цепочка `extends`, влитые в класс (ближайшее определение побеждает).
+/// Прямые родители class-like объявления: `extends`, затем `implements`, затем `traits`; повторы убраны.
+fn direct_parents(class: &ClassFacts) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for name in class
+        .extends
+        .iter()
+        .chain(&class.implements)
+        .chain(&class.traits)
+    {
+        if !out.iter().any(|seen| seen.eq_ignore_ascii_case(name)) {
+            out.push(name.clone());
+        }
+    }
+    out
+}
+
+/// Property родителей, интерфейсов и trait-ов, влитые в класс вместе с цепочкой предков (ближайшее определение
+/// побеждает).
+///
+/// Обход в ширину: сначала прямые родители (`extends`, `implements`, `traits`), затем их родители. Собственные
+/// property класса и ближайших предков регистрируются раньше, поэтому дальние копии не перекрывают их.
+/// Найденные предки дописываются в `extends` результата.
 pub fn merge_inheritance(classes: Vec<ClassFacts>) -> Vec<ClassFacts> {
     let mut by_full: HashMap<String, usize> = HashMap::new();
     let mut by_short: HashMap<String, Vec<usize>> = HashMap::new();
@@ -113,16 +140,20 @@ pub fn merge_inheritance(classes: Vec<ClassFacts>) -> Vec<ClassFacts> {
             let mut merged = class.clone();
             let mut seen: HashSet<String> =
                 class.properties.iter().map(|p| p.name.clone()).collect();
-            let mut queue: Vec<String> = class.extends.clone();
+            let mut frontier: Vec<String> = direct_parents(class);
             let mut visited: HashSet<usize> = HashSet::new();
             let mut ancestors = Vec::new();
-            while let Some(name) = queue.pop() {
-                let Some(at) = resolve(&name) else { continue };
-                if !visited.insert(at) {
-                    continue;
+            while !frontier.is_empty() {
+                let mut next = Vec::new();
+                for name in frontier {
+                    let Some(at) = resolve(&name) else { continue };
+                    if !visited.insert(at) {
+                        continue;
+                    }
+                    ancestors.push(at);
+                    next.extend(direct_parents(&classes[at]));
                 }
-                ancestors.push(at);
-                queue.extend(classes[at].extends.iter().cloned());
+                frontier = next;
             }
             for at in ancestors {
                 let parent = &classes[at];
@@ -153,6 +184,8 @@ mod tests {
             name: name.into(),
             short: short_name(name).into(),
             extends: extends.iter().map(|s| s.to_string()).collect(),
+            implements: vec![],
+            traits: vec![],
             properties: props
                 .iter()
                 .map(|(n, d)| PropFacts {
@@ -180,5 +213,107 @@ mod tests {
         let chain = merged.iter().find(|c| c.short == "HotelChain").unwrap();
         assert!(chain.properties.iter().any(|p| p.name == "tableName"));
         assert!(chain.extends.iter().any(|e| e == "Billet"));
+    }
+
+    /// Разбор исходника через `file_facts`: классы, интерфейсы и trait-ы.
+    fn parsed(src: &str) -> Vec<ClassFacts> {
+        facts::file_facts("x.php", src.as_bytes())
+    }
+
+    /// Временный проект на диске для `scan_parents` (каталог уникален для теста).
+    fn project(tag: &str, src: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("callgraph-flow-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.php"), src).unwrap();
+        dir
+    }
+
+    const ITEM: &str = r#"<?php
+namespace App;
+
+interface Src {}
+
+trait HasName {
+    private string $name;
+}
+
+class Item implements Src {
+    use HasName;
+    public int $id;
+}
+"#;
+
+    #[test]
+    fn interface_and_trait_are_parents() {
+        let classes = parsed(ITEM);
+        let item = classes.iter().find(|c| c.short == "Item").unwrap();
+        assert_eq!(item.extends, Vec::<String>::new());
+        assert_eq!(item.implements, vec!["App\\Src"]);
+        assert_eq!(item.traits, vec!["App\\HasName"]);
+
+        let dir = project("parents", ITEM);
+        let parents = scan_parents(&dir).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        // `scan_parents` отдаёт только прямых родителей: интерфейс и trait, без разворота цепочки.
+        assert_eq!(
+            parents.get("App\\Item").cloned().unwrap_or_default(),
+            vec!["App\\Src".to_string(), "App\\HasName".to_string()]
+        );
+
+        let merged = merge_inheritance(classes);
+        let item = merged.iter().find(|c| c.short == "Item").unwrap();
+        assert!(item.extends.iter().any(|p| p == "App\\Src"), "{item:?}");
+        assert!(item.extends.iter().any(|p| p == "App\\HasName"), "{item:?}");
+    }
+
+    #[test]
+    fn trait_property_is_inherited_by_using_class() {
+        let merged = merge_inheritance(parsed(ITEM));
+        let item = merged.iter().find(|c| c.short == "Item").unwrap();
+        let name = item
+            .properties
+            .iter()
+            .find(|p| p.name == "name")
+            .unwrap_or_else(|| panic!("нет property name: {item:?}"));
+        assert_eq!(name.ty.as_deref(), Some("string"));
+    }
+
+    #[test]
+    fn transitive_parents_include_extends_and_implements() {
+        let src = r#"<?php
+namespace App;
+
+interface Src {}
+
+class Base implements Src {}
+
+trait Sluggable {
+    private string $slug;
+}
+
+class Child extends Base implements Src {
+    use Sluggable;
+}
+"#;
+        let dir = project("transitive", src);
+        let parents = scan_parents(&dir).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        let child = parents.get("App\\Child").cloned().unwrap_or_default();
+        // Прямые родители: Base, Src (повтор из `implements` убран), Sluggable.
+        assert!(child.contains(&"App\\Base".to_string()), "{child:?}");
+        assert!(child.contains(&"App\\Src".to_string()), "{child:?}");
+        assert!(child.contains(&"App\\Sluggable".to_string()), "{child:?}");
+        assert_eq!(child.len(), 3, "{child:?}");
+
+        // `merge_inheritance` разворачивает цепочку: в `extends` попадают и предки Base.
+        let merged = merge_inheritance(parsed(src));
+        let child = merged.iter().find(|c| c.short == "Child").unwrap();
+        for parent in ["App\\Base", "App\\Src", "App\\Sluggable"] {
+            assert!(
+                child.extends.iter().any(|p| p == parent),
+                "нет {parent}: {child:?}"
+            );
+        }
+        assert!(child.properties.iter().any(|p| p.name == "slug"));
     }
 }

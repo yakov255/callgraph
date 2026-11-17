@@ -3,14 +3,14 @@
 //!
 //! Термы группируются в порядке аргументов; внутри терма порядок задаёт `Index::traces`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fmt::Write as _;
 use std::io::Write;
 use std::path::Path;
 
 use crate::cli::Command;
 use crate::error::Result;
-use crate::flow::{Index, Trace, scan_flow, scan_parents};
+use crate::flow::{Index, Mapping, Trace, scan_flow, scan_parents, scan_project};
 use crate::skill::SkillHome;
 
 /// Верхняя граница числа блоков (текст) и элементов (JSON) без `--full`.
@@ -55,18 +55,22 @@ impl Command for TraceCommand {
         let root = super::project_root(&self.home, self.project.as_deref())?;
         let files = scan_flow(&root)?;
         let parents = scan_parents(&root)?;
-        let index = Index::build_with_parents(&files, &parents);
-        let groups: Vec<(String, Vec<Trace>)> = self
-            .terms
-            .iter()
-            .map(|term| {
-                let mut traces = index.traces(term);
-                if self.must_only {
-                    traces.retain(|trace| trace.must);
-                }
-                (term.clone(), traces)
-            })
-            .collect();
+        // Сопоставление даёт `sql:`-атомы: `prop:` привязывается к таблице/колонке,
+        // а `<table>.<column>` фильтрует по таблице.
+        let mapping = scan_project(&root)?;
+        let index = Index::build_with_parents(&files, &parents).with_mapping(&mapping);
+        let mut groups: Vec<(String, Vec<Trace>)> = Vec::with_capacity(self.terms.len());
+        for term in &self.terms {
+            let mut traces = if split_qualified(term).is_some() {
+                traces_for(&index, Some(&mapping), term)
+            } else {
+                index.traces(term)
+            };
+            if self.must_only {
+                traces.retain(|trace| trace.must);
+            }
+            groups.push((term.clone(), traces));
+        }
         if self.json {
             writeln!(out, "{}", render_json(&root, &groups, self.full)?)?;
             return Ok(0);
@@ -74,6 +78,81 @@ impl Command for TraceCommand {
         out.write_all(render_text(&root, &self.terms, &groups, self.full).as_bytes())?;
         Ok(0)
     }
+}
+
+/// `<table>.<column>`: ровно одна точка, обе части непустые. Иначе терм остаётся простым.
+fn split_qualified(term: &str) -> Option<(&str, &str)> {
+    let mut parts = term.split('.');
+    let table = parts.next()?;
+    let column = parts.next()?;
+    if parts.next().is_some() || table.is_empty() || column.is_empty() {
+        return None;
+    }
+    Some((table, column))
+}
+
+/// Совпадает ли запись сопоставления с таблицей и колонкой (без учёта регистра).
+fn entry_matches(entry_table: &str, entry_column: &str, table: &str, column: &str) -> bool {
+    entry_table.eq_ignore_ascii_case(table) && entry_column.eq_ignore_ascii_case(column)
+}
+
+/// Цепочка содержит property этой записи (`prop:…::<property>`) или `sql:<table>.<column>`.
+fn chain_matches(chain: &[String], property: &str, table: &str, column: &str) -> bool {
+    let prop_suffix = format!("::{property}");
+    let sql_value = format!("{table}.{column}");
+    chain.iter().any(|atom| {
+        (atom.starts_with("prop:") && atom.ends_with(&prop_suffix))
+            || atom
+                .strip_prefix("sql:")
+                .is_some_and(|value| value.eq_ignore_ascii_case(&sql_value))
+    })
+}
+
+/// Дедупликация по `(file, line, expr, column)` с сохранением порядка.
+fn dedup_traces(traces: impl IntoIterator<Item = Trace>) -> Vec<Trace> {
+    let mut seen = HashSet::new();
+    let mut unique = Vec::new();
+    for trace in traces {
+        let key = (
+            trace.file.clone(),
+            trace.line,
+            trace.expr.clone(),
+            trace.column.clone(),
+        );
+        if seen.insert(key) {
+            unique.push(trace);
+        }
+    }
+    unique
+}
+
+/// Термы `<table>.<column>` фильтруются по записям сопоставления и цепочке;
+/// без записи — обычный поиск по колонке без фильтра цепочки.
+fn traces_for(index: &Index, mapping: Option<&Mapping>, term: &str) -> Vec<Trace> {
+    let Some((table, column)) = split_qualified(term) else {
+        return index.traces(term);
+    };
+    let Some(mapping) = mapping else {
+        return index.traces(column);
+    };
+    let entries: Vec<(&str, &str)> = mapping
+        .columns
+        .iter()
+        .filter(|(_, entry)| entry_matches(&entry.table, &entry.column, table, column))
+        .map(|((_, property), entry)| (property.as_str(), entry.column.as_str()))
+        .collect();
+    if entries.is_empty() {
+        return index.traces(column);
+    }
+    let mut traces = Vec::new();
+    for (property, entry_column) in entries {
+        for trace in index.traces(entry_column) {
+            if chain_matches(&trace.chain, property, table, column) {
+                traces.push(trace);
+            }
+        }
+    }
+    dedup_traces(traces)
 }
 
 /// Путь относительно `root`, если файл лежит внутри проекта; иначе — как есть.
@@ -179,6 +258,86 @@ mod tests {
 
     fn one(term: &str, traces: Vec<Trace>) -> (Vec<String>, Vec<(String, Vec<Trace>)>) {
         (vec![term.to_string()], vec![(term.to_string(), traces)])
+    }
+
+    #[test]
+    fn split_qualified_accepts_only_one_dot_with_both_sides() {
+        assert_eq!(split_qualified("users.email"), Some(("users", "email")));
+        assert_eq!(split_qualified("users"), None);
+        assert_eq!(split_qualified("users.email.extra"), None);
+        assert_eq!(split_qualified(".email"), None);
+        assert_eq!(split_qualified("users."), None);
+    }
+
+    #[test]
+    fn entry_matches_table_and_column_case_insensitively() {
+        assert!(entry_matches("Users", "EMAIL", "users", "email"));
+        assert!(!entry_matches("orders", "email", "users", "email"));
+        assert!(!entry_matches("users", "name", "users", "email"));
+    }
+
+    #[test]
+    fn chain_matches_property_suffix_or_sql_atom() {
+        let property = trace(
+            "/p/src/a.php",
+            "f",
+            1,
+            "$x",
+            &[
+                "key:service_type",
+                r"prop:Api\Queue\Repository::serviceType",
+            ],
+        );
+        assert!(chain_matches(
+            &property.chain,
+            "serviceType",
+            "queue",
+            "service_type"
+        ));
+        let sql = trace("/p/src/a.php", "f", 2, "$x", &["sql:queue.service_type"]);
+        assert!(chain_matches(
+            &sql.chain,
+            "serviceType",
+            "queue",
+            "service_type"
+        ));
+        let other = trace(
+            "/p/src/a.php",
+            "f",
+            3,
+            "$x",
+            &["prop:Other::otherType", "sql:orders.service_type"],
+        );
+        assert!(!chain_matches(
+            &other.chain,
+            "serviceType",
+            "queue",
+            "service_type"
+        ));
+    }
+
+    #[test]
+    fn dedup_traces_keeps_first_by_file_line_expr_column() {
+        let first = trace("/p/x.php", "f", 1, "$x", &["lit"]);
+        let duplicate = trace("/p/x.php", "g", 1, "$x", &["other"]);
+        let unique = trace("/p/x.php", "f", 2, "$y", &["lit"]);
+        let traces = dedup_traces(vec![first, duplicate, unique]);
+        assert_eq!(traces.len(), 2);
+        assert_eq!(traces[0].method, "f");
+        assert_eq!(traces[1].line, 2);
+    }
+
+    #[test]
+    fn qualified_term_keeps_original_name_in_text_and_json() {
+        let root = Path::new("/project");
+        let (terms, groups) = one(
+            "queue.service_type",
+            vec![trace("/project/src/a.php", "f", 5, "$x", &["lit"])],
+        );
+        let text = render_text(root, &terms, &groups, false);
+        assert!(text.contains("trace: queue.service_type · 1 reads in 1 files\n"));
+        let json = render_json(root, &groups, false).unwrap();
+        assert!(json.contains("\"term\": \"queue.service_type\""));
     }
 
     #[test]

@@ -44,6 +44,8 @@ pub struct Assign {
     /// `$x`, `this->p`, `Class::p` или `$x['k']`.
     pub lhs: String,
     pub origins: Vec<String>,
+    /// `must`-множество значения (см. `Read::must`).
+    pub must: Vec<String>,
 }
 
 /// Чтение значения (условие, property, ключ массива) — узел выдачи.
