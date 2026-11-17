@@ -30,6 +30,8 @@ pub struct MethodFlow {
     pub container: Option<String>,
     /// Число параметров (для `p:<id>#<i>`).
     pub params: usize,
+    /// Имена параметров без `$` (для именованных аргументов).
+    pub param_names: Vec<String>,
     pub assigns: Vec<Assign>,
     pub reads: Vec<Read>,
     pub returns: Vec<Read>,
@@ -73,10 +75,15 @@ pub struct ReceiverEdge {
 pub struct ArgEdge {
     pub line: u32,
     pub target: String,
+    /// Позиция параметра; `usize::MAX` для именованного/spread-аргумента.
     pub index: usize,
     pub origins: Vec<String>,
     /// `must`-множество аргумента (см. `Read::must`).
     pub must: Vec<String>,
+    /// Имя именованного аргумента (`foo(name: …)`), без `$`.
+    pub name: Option<String>,
+    /// `foo(...$args)`: истоки раскладываются по всем параметрам.
+    pub spread: bool,
 }
 
 /// Одна цепочка от источника до чтения.

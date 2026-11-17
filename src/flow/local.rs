@@ -45,12 +45,14 @@ pub fn file_facts(path: &str, source: &[u8]) -> Vec<FlowFile> {
 /// Разобрать файл и вернуть факты по методам с таблицей типов возврата проекта.
 pub fn file_facts_with_types(path: &str, source: &[u8], types: &MethodTypes) -> Vec<FlowFile> {
     MagoAdapter.parse(path, source, |parsed| {
+        let magic = magic_classes(parsed);
         let mut collector = Collector {
             parsed,
             resolver: NameResolver::new(None),
             methods: Vec::new(),
             top: None,
             method_types: types,
+            magic,
         };
         collector.statements(parsed.program.statements.as_slice());
         if let Some(top) = collector.top {
@@ -75,6 +77,8 @@ struct Collector<'p, 'a, 't> {
     top: Option<Analyzer<'p, 'a, 't>>,
     /// Таблица типов возврата проекта.
     method_types: &'t MethodTypes,
+    /// Классы файла с магическими аксессорами (`__get`/`__set`).
+    magic: HashSet<String>,
 }
 
 impl<'a, 't> Collector<'_, 'a, 't> {
@@ -111,6 +115,10 @@ impl<'a, 't> Collector<'_, 'a, 't> {
                     id,
                     HashMap::new(),
                     self.method_types,
+                    ClassFacts {
+                        magic: self.magic.clone(),
+                        props: Vec::new(),
+                    },
                 );
                 analyzer.seed_params(&node.parameter_list);
                 analyzer.statements(node.body.statements.as_slice());
@@ -135,6 +143,10 @@ impl<'a, 't> Collector<'_, 'a, 't> {
                 TOP.to_string(),
                 HashMap::new(),
                 self.method_types,
+                ClassFacts {
+                    magic: self.magic.clone(),
+                    props: Vec::new(),
+                },
             )
         });
         analyzer.resolver = self.resolver.clone();
@@ -161,6 +173,7 @@ impl<'a, 't> Collector<'_, 'a, 't> {
         self.resolver.enter_container(&short, parents);
         let full = self.resolver.resolve_class("self");
         let types = self.prop_types(members);
+        let properties = self.property_names(members);
         for member in members.iter() {
             let ClassLikeMember::Method(method) = member else {
                 continue;
@@ -176,6 +189,10 @@ impl<'a, 't> Collector<'_, 'a, 't> {
                 id,
                 types.clone(),
                 self.method_types,
+                ClassFacts {
+                    magic: self.magic.clone(),
+                    props: properties.clone(),
+                },
             );
             analyzer.seed_params(&method.parameter_list);
             analyzer.statements(block.statements.as_slice());
@@ -229,6 +246,39 @@ impl<'a, 't> Collector<'_, 'a, 't> {
             }
         }
         types
+    }
+
+    /// Имена объявленных свойств класса (без `$`), включая продвинутые параметры.
+    fn property_names(&self, members: &Sequence<'a, ClassLikeMember<'a>>) -> Vec<String> {
+        let mut names = Vec::new();
+        for member in members.iter() {
+            match member {
+                ClassLikeMember::Property(Property::Plain(property)) => {
+                    for item in property.items.iter() {
+                        let variable = match item {
+                            PropertyItem::Abstract(item) => &item.variable,
+                            PropertyItem::Concrete(item) => &item.variable,
+                        };
+                        names.push(lossy(variable.name).trim_start_matches('$').to_string());
+                    }
+                }
+                ClassLikeMember::Method(method)
+                    if lossy(method.name.value).eq_ignore_ascii_case("__construct") =>
+                {
+                    for parameter in method.parameter_list.parameters.iter() {
+                        if parameter.is_promoted_property() {
+                            names.push(
+                                lossy(parameter.variable.name)
+                                    .trim_start_matches('$')
+                                    .to_string(),
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        names
     }
 
     /// Импорты `use`: классы (функции и константы пропускаются).
@@ -324,6 +374,87 @@ impl<'a> ReturnCollector<'_, 'a> {
 }
 
 // ---------------------------------------------------------------------------
+// Магические аксессоры: предварительный проход по объявлениям файла.
+// ---------------------------------------------------------------------------
+
+/// Полные имена классов файла, объявляющих `__get`/`__set`.
+fn magic_classes(parsed: &ParsedFile<'_>) -> HashSet<String> {
+    struct MagicCollector<'p, 'a> {
+        parsed: &'p ParsedFile<'a>,
+        resolver: NameResolver,
+        magic: HashSet<String>,
+    }
+
+    impl<'a> MagicCollector<'_, 'a> {
+        fn statements(&mut self, statements: &[Statement<'a>]) {
+            for statement in statements {
+                self.statement(statement);
+            }
+        }
+
+        fn statement(&mut self, statement: &Statement<'a>) {
+            match statement {
+                Statement::Namespace(node) => {
+                    let ns = node
+                        .name
+                        .map(|name| lossy(name.value()).trim_start_matches('\\').to_string());
+                    self.resolver = NameResolver::new(ns);
+                    self.statements(node.statements().as_slice());
+                }
+                Statement::Use(node) => apply_imports(self.parsed, &mut self.resolver, &node.items),
+                Statement::Class(node) => {
+                    self.class_like(node.name.value, node.extends.as_ref(), &node.members)
+                }
+                Statement::Interface(node) => {
+                    self.class_like(node.name.value, node.extends.as_ref(), &node.members)
+                }
+                Statement::Trait(node) => self.class_like(node.name.value, None, &node.members),
+                Statement::Enum(node) => self.class_like(node.name.value, None, &node.members),
+                _ => {}
+            }
+        }
+
+        fn class_like(
+            &mut self,
+            name: &[u8],
+            extends: Option<&Extends<'a>>,
+            members: &Sequence<'a, ClassLikeMember<'a>>,
+        ) {
+            let short = lossy(name);
+            let parents: Vec<String> = extends
+                .map(|node| {
+                    node.types
+                        .iter()
+                        .map(|ty| self.resolver.resolve_class(&self.parsed.text(ty.span())))
+                        .collect()
+                })
+                .unwrap_or_default();
+            self.resolver.enter_container(&short, parents);
+            let magic = members.iter().any(|member| match member {
+                ClassLikeMember::Method(method) => {
+                    let name = lossy(method.name.value);
+                    name.eq_ignore_ascii_case("__get") || name.eq_ignore_ascii_case("__set")
+                }
+                _ => false,
+            });
+            if magic {
+                let full = self.resolver.resolve_class("self");
+                self.magic.insert(full);
+            }
+            self.resolver.leave_container();
+        }
+    }
+
+    let mut collector = MagicCollector {
+        parsed,
+        resolver: NameResolver::new(None),
+        magic: HashSet::new(),
+    };
+    collector.statements(parsed.program.statements.as_slice());
+    collector.magic
+}
+
+// ---------------------------------------------------------------------------
 // Анализ тела метода.
 // ---------------------------------------------------------------------------
 
@@ -340,8 +471,21 @@ struct FlowState {
     bools: HashMap<String, bool>,
     /// Переменные, гарантированно равные `null`.
     nulls: HashSet<String>,
+    /// Переменные-ключи `foreach ($row as $k => $v)`.
+    keys: HashSet<String>,
+    /// После `extract($arr)` неизвестная переменная читается как `key:<name>`.
+    extracted: bool,
     /// Путь завершён (`return`): до конца блока записи не идут.
     terminated: bool,
+}
+
+/// Факты файла и класса, нужные анализатору: магические аксессоры и свойства.
+#[derive(Debug, Clone, Default)]
+struct ClassFacts {
+    /// Классы файла, объявляющие `__get`/`__set`.
+    magic: HashSet<String>,
+    /// Объявленные свойства текущего класса (без `$`).
+    props: Vec<String>,
 }
 
 struct Analyzer<'p, 'a, 't> {
@@ -359,6 +503,12 @@ struct Analyzer<'p, 'a, 't> {
     paths: usize,
     /// Типы возврата методов проекта (`Class::method` -> класс).
     method_types: &'t MethodTypes,
+    /// Классы файла с магическими аксессорами (`__get`/`__set`).
+    magic: HashSet<String>,
+    /// Объявленные свойства текущего класса (без `$`).
+    props: Vec<String>,
+    /// Переменные, объявленные через `global` в этом методе.
+    globals: HashSet<String>,
     flow: MethodFlow,
 }
 
@@ -370,6 +520,7 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
         method: String,
         types: HashMap<String, String>,
         method_types: &'t MethodTypes,
+        class_facts: ClassFacts,
     ) -> Self {
         Self {
             parsed,
@@ -388,6 +539,9 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
             depth: 0,
             paths: 0,
             method_types,
+            magic: class_facts.magic,
+            props: class_facts.props,
+            globals: HashSet::new(),
         }
     }
 
@@ -437,6 +591,17 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
                 self.loop_join(before);
             }
             Statement::Switch(node) => self.switch_statement(node),
+            Statement::Global(node) => {
+                for variable in node.variables.iter() {
+                    let Variable::Direct(variable) = variable else {
+                        continue;
+                    };
+                    let name = lossy(variable.name);
+                    let atom = format!("prop:global::{}", name.trim_start_matches('$'));
+                    self.set_var(&name, &[atom], &[]);
+                    self.globals.insert(name);
+                }
+            }
             Statement::Try(node) => self.try_statement(node),
             Statement::Return(node) => {
                 if let Some(value) = node.value {
@@ -531,31 +696,24 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
         self.state = merge_states(before, after);
     }
 
-    /// `switch`: все ветки в одном состоянии, must — пересечение по веткам.
+    /// `switch`: случаи идут последовательно (fallthrough), поэтому более
+    /// поздний случай видит состояние предыдущего. Без `default` возможен путь
+    /// «ни один случай не сработал»: слияние всего fallthrough с исходным
+    /// состоянием (may union, must intersection).
     fn switch_statement(&mut self, node: &Switch<'a>) {
         self.condition(node.expression);
         let before = self.state.clone();
         let has_default = node.body.has_default_case();
-        let mut merged: Option<FlowState> = None;
         for case in node.body.cases() {
-            self.state = before.clone();
             if let Some(expression) = case.expression() {
                 self.expression_statement(expression);
             }
             self.statements(case.statements());
-            let arm = self.state.clone();
-            merged = Some(match merged {
-                Some(previous) => merge_states(previous, arm),
-                None => arm,
-            });
         }
-        let merged = match merged {
-            Some(merged) if has_default => merged,
-            // Без `default` возможен путь «ни одна ветка не сработала».
-            Some(merged) => merge_states(merged, before),
-            None => before,
-        };
-        self.state = merged;
+        if !has_default {
+            let fallthrough = self.state.clone();
+            self.state = merge_states(fallthrough, before);
+        }
     }
 
     /// `try` / `catch` / `finally`: тело `try` с текущего состояния, каждое
@@ -695,6 +853,7 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
             && let Some(name) = direct_var_name(key)
         {
             self.set_var(&name, &["unknown".to_string()], &[]);
+            self.state.keys.insert(name);
         }
         self.statements(node.body.statements());
     }
@@ -720,10 +879,19 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
                 }
                 self.flow.assigns.push(Assign {
                     line,
-                    lhs: name,
+                    lhs: name.clone(),
                     origins: origins.clone(),
-                    must: must_within(must, &origins),
+                    must: must_within(must.clone(), &origins),
                 });
+                // `global $x`: значение живёт и в глобальной области.
+                if self.globals.contains(&name) {
+                    self.flow.assigns.push(Assign {
+                        line,
+                        lhs: format!("prop:global::{}", name.trim_start_matches('$')),
+                        origins: origins.clone(),
+                        must: must_within(must, &origins),
+                    });
+                }
             }
             Expression::Access(Access::Property(access)) => {
                 let ClassLikeMemberSelector::Identifier(property) = &access.property else {
@@ -747,6 +915,16 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
                     self.flow.assigns.push(Assign {
                         line,
                         lhs: format!("prop:{class}::{name}"),
+                        origins: origins.clone(),
+                        must: must_within(must, &origins),
+                    });
+                }
+            }
+            Expression::Access(Access::StaticProperty(access)) => {
+                if let Some(atom) = self.static_property_atom(access) {
+                    self.flow.assigns.push(Assign {
+                        line,
+                        lhs: atom,
                         origins: origins.clone(),
                         must: must_within(must, &origins),
                     });
@@ -853,33 +1031,42 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
         match expression.unparenthesized() {
             Expression::Variable(Variable::Direct(variable)) => {
                 let name = lossy(variable.name);
-                self.state
-                    .vars
-                    .get(&name)
-                    .cloned()
-                    .unwrap_or_else(|| vec!["unknown".into()])
+                let known = self.state.vars.get(&name).cloned();
+                if let Some(origins) = &known
+                    && significant(origins)
+                {
+                    return origins.clone();
+                }
+                // `extract($arr)` наполняет область видимости ключами массива.
+                if self.state.extracted && name != "$this" {
+                    let atom = format!("key:{}", name.trim_start_matches('$'));
+                    self.record_read(expression, vec![atom.clone()], Vec::new());
+                    return vec![atom];
+                }
+                known.unwrap_or_else(|| vec!["unknown".into()])
             }
             Expression::Variable(_) => vec!["unknown".into()],
             Expression::Literal(_) | Expression::Identifier(_) => vec!["lit".into()],
             Expression::Access(Access::Property(access)) => {
                 self.origins(access.object);
-                let origins = self
-                    .property_atom(access.object, &access.property)
-                    .map(|atom| vec![atom])
-                    .unwrap_or_else(|| vec!["unknown".into()]);
-                self.record_read(expression, origins.clone(), origins.clone());
+                let (origins, must) = self.property_read(access.object, &access.property);
+                self.record_read(expression, origins.clone(), must);
                 origins
             }
             Expression::Access(Access::NullSafeProperty(access)) => {
                 self.origins(access.object);
+                let (origins, must) = self.property_read(access.object, &access.property);
+                self.record_read(expression, origins.clone(), must);
+                origins
+            }
+            Expression::Access(Access::StaticProperty(access)) => {
                 let origins = self
-                    .property_atom(access.object, &access.property)
+                    .static_property_atom(access)
                     .map(|atom| vec![atom])
                     .unwrap_or_else(|| vec!["unknown".into()]);
                 self.record_read(expression, origins.clone(), origins.clone());
                 origins
             }
-            Expression::Access(Access::StaticProperty(_)) => vec!["unknown".into()],
             Expression::Access(_) => vec!["lit".into()],
             Expression::ArrayAccess(access) => {
                 let mut origins = self.origins(access.array);
@@ -908,6 +1095,14 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
             Expression::Binary(binary) => {
                 let mut origins = self.origins(binary.lhs);
                 origins.extend(self.origins(binary.rhs));
+                // `$k === 'name_en'`, где `$k` — ключ `foreach`: колонка-ключ.
+                if matches!(
+                    binary.operator,
+                    BinaryOperator::Identical(_) | BinaryOperator::Equal(_)
+                ) && let Some(key) = self.key_literal(binary.lhs, binary.rhs)
+                {
+                    self.record_read(expression, vec![format!("key:{key}")], Vec::new());
+                }
                 norm(origins)
             }
             Expression::UnaryPrefix(unary) => self.origins(unary.operand),
@@ -926,20 +1121,20 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
             }
             Expression::Match(node) => {
                 self.condition(node.expression);
+                let mut origins = Vec::new();
                 for arm in node.arms.iter() {
-                    match arm {
-                        MatchArm::Expression(arm) => {
-                            for condition in arm.conditions.iter() {
-                                self.origins(condition);
-                            }
-                            self.origins(arm.expression);
-                        }
-                        MatchArm::Default(arm) => {
-                            self.origins(arm.expression);
+                    if let MatchArm::Expression(arm) = arm {
+                        for condition in arm.conditions.iter() {
+                            self.origins(condition);
                         }
                     }
+                    origins.extend(self.origins(arm.expression()));
                 }
-                vec!["unknown".into()]
+                if origins.is_empty() {
+                    vec!["unknown".into()]
+                } else {
+                    norm(origins)
+                }
             }
             Expression::Construct(_) => vec!["unknown".into()],
             Expression::CompositeString(_) => vec!["lit".into()],
@@ -975,15 +1170,16 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
                 .unwrap_or_default(),
             Expression::Variable(_) => Vec::new(),
             Expression::Literal(_) | Expression::Identifier(_) => vec!["lit".into()],
-            Expression::Access(Access::Property(access)) => self
-                .property_atom(access.object, &access.property)
+            Expression::Access(Access::Property(access)) => {
+                self.property_read(access.object, &access.property).1
+            }
+            Expression::Access(Access::NullSafeProperty(access)) => {
+                self.property_read(access.object, &access.property).1
+            }
+            Expression::Access(Access::StaticProperty(access)) => self
+                .static_property_atom(access)
                 .map(|atom| vec![atom])
                 .unwrap_or_default(),
-            Expression::Access(Access::NullSafeProperty(access)) => self
-                .property_atom(access.object, &access.property)
-                .map(|atom| vec![atom])
-                .unwrap_or_default(),
-            Expression::Access(Access::StaticProperty(_)) => Vec::new(),
             Expression::Access(_) => vec!["lit".into()],
             Expression::ArrayAccess(access) => {
                 let mut must = self.origins_must(access.array);
@@ -1065,6 +1261,9 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
         if let Some(origins) = self.call_user_func(call, used) {
             return origins;
         }
+        if let Some(origins) = self.builtin_call(call, used) {
+            return origins;
+        }
         let object = match call {
             Call::Method(node) => Some(node.object),
             Call::NullSafeMethod(node) => Some(node.object),
@@ -1101,6 +1300,146 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
             }
             None => vec!["unknown".into()],
         }
+    }
+
+    /// Встроенные функции с прозрачными истоками: `array_*`, `extract`,
+    /// `compact`, `get_object_vars`, `array_map`.
+    fn builtin_call(&mut self, call: &Call<'a>, used: bool) -> Option<Vec<String>> {
+        let Call::Function(_) = call else {
+            return None;
+        };
+        let name = self.call_target(call)?;
+        let short = name
+            .rsplit('\\')
+            .next()
+            .unwrap_or(&name)
+            .to_ascii_lowercase();
+        let line = self.line_of(call);
+        let arguments = call.get_argument_list();
+        let origins = match short.as_str() {
+            // Массив на входе, массив на выходе: истоки проходят насквозь.
+            "array_values" | "array_filter" | "array_merge" | "array_slice" | "array_reverse"
+            | "array_unique" | "array_diff" | "array_intersect" | "array_splice" => {
+                let mut origins = Vec::new();
+                for argument in arguments.arguments.iter() {
+                    origins.extend(self.origins(argument_value(argument)));
+                }
+                norm(origins)
+            }
+            // `extract($arr)`: дальше неизвестные переменные — ключи массива.
+            "extract" => {
+                let mut origins = Vec::new();
+                for argument in arguments.arguments.iter() {
+                    origins.extend(self.origins(argument_value(argument)));
+                }
+                self.state.extracted = true;
+                norm(origins)
+            }
+            // `compact('a', 'b')`: значения названных переменных.
+            "compact" => {
+                let mut origins = Vec::new();
+                for argument in arguments.arguments.iter() {
+                    let value = argument_value(argument);
+                    let Expression::Literal(Literal::String(string)) = value.unparenthesized()
+                    else {
+                        origins.extend(self.origins(value));
+                        continue;
+                    };
+                    let name = string.value.map(lossy).unwrap_or_else(|| lossy(string.raw));
+                    match self.state.vars.get(&format!("${name}")) {
+                        Some(found) => origins.extend(found.clone()),
+                        None => origins.push(format!("key:{name}")),
+                    }
+                }
+                norm(origins)
+            }
+            // `get_object_vars($this)`: все объявленные свойства класса.
+            "get_object_vars" => {
+                let mut origins = Vec::new();
+                for argument in arguments.arguments.iter() {
+                    let value = argument_value(argument);
+                    if is_this(value) {
+                        for property in &self.props {
+                            origins.push(format!("prop:this::{property}"));
+                        }
+                    } else {
+                        origins.extend(self.origins(value));
+                    }
+                }
+                norm(origins)
+            }
+            "array_map" => self.array_map(arguments, line),
+            _ => return None,
+        };
+        let origins = norm(origins);
+        if used {
+            self.record_read(call, origins.clone(), Vec::new());
+        }
+        Some(origins)
+    }
+
+    /// `array_map(callback, ...arrays)`: истоки результата — по цели callback
+    /// (`c:<target>@<line>`), телу замыкания/стрелочной функции или массивам.
+    fn array_map(&mut self, arguments: &ArgumentList<'a>, line: u32) -> Vec<String> {
+        let mut arrays = Vec::new();
+        let mut result: Vec<String> = Vec::new();
+        for (index, argument) in arguments.arguments.iter().enumerate() {
+            let value = argument_value(argument);
+            if index == 0 {
+                match value.unparenthesized() {
+                    Expression::Closure(closure) => {
+                        result = self.closure_returns(closure);
+                        continue;
+                    }
+                    Expression::ArrowFunction(function) => {
+                        let before = self.state.clone();
+                        self.closure_params(&function.parameter_list);
+                        result = self.origins(function.expression);
+                        self.merge_closure(before);
+                        continue;
+                    }
+                    _ => {}
+                }
+                if let Some(target) = self.callable_target(value) {
+                    result = vec![format!("c:{target}@{line}")];
+                    continue;
+                }
+            }
+            arrays.extend(self.origins(value));
+        }
+        if result.is_empty() {
+            norm(arrays)
+        } else {
+            norm(result)
+        }
+    }
+
+    /// Тело замыкания в отдельном анализаторе: union истоков его `returns`.
+    fn closure_returns(&mut self, closure: &Closure<'a>) -> Vec<String> {
+        let mut nested = Analyzer::new(
+            self.parsed,
+            self.resolver.clone(),
+            self.class.clone(),
+            self.method.clone(),
+            self.state.types.clone(),
+            self.method_types,
+            ClassFacts {
+                magic: self.magic.clone(),
+                props: self.props.clone(),
+            },
+        );
+        nested.state.vars = self.state.vars.clone();
+        nested.state.must = self.state.must.clone();
+        nested.state.keys = self.state.keys.clone();
+        nested.state.extracted = self.state.extracted;
+        nested.closure_params(&closure.parameter_list);
+        nested.statements(closure.body.statements.as_slice());
+        let mut origins = Vec::new();
+        for ret in &nested.flow.returns {
+            origins.extend(ret.origins.iter().cloned());
+        }
+        self.flow.reads.extend(nested.flow.reads);
+        norm(origins)
     }
 
     /// `must`-исток вызова: для `array_column`/`call_user_func*` — тот же
@@ -1173,6 +1512,8 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
                     index,
                     origins: norm(origins),
                     must: norm(must),
+                    name: None,
+                    spread: false,
                 });
             }
         }
@@ -1322,6 +1663,8 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
                 index,
                 origins: norm(origins),
                 must: norm(must),
+                name: None,
+                spread: false,
             });
             index += 1;
         }
@@ -1346,17 +1689,29 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
             return;
         };
         for (index, argument) in list.arguments.iter().enumerate() {
-            let Argument::Positional(argument) = argument else {
-                continue;
+            let (index, name, spread, value) = match argument {
+                Argument::Positional(argument) => {
+                    let spread = argument.ellipsis.is_some();
+                    let index = if spread { usize::MAX } else { index };
+                    (index, None, spread, argument.value)
+                }
+                Argument::Named(argument) => (
+                    usize::MAX,
+                    Some(lossy(argument.name.value)),
+                    false,
+                    argument.value,
+                ),
             };
-            let origins = self.origins(argument.value);
-            let must = self.origins_must(argument.value);
+            let origins = self.origins(value);
+            let must = self.origins_must(value);
             self.flow.args.push(ArgEdge {
                 line,
                 target: target.to_string(),
                 index,
                 origins: norm(origins),
                 must: norm(must),
+                name,
+                spread,
             });
         }
     }
@@ -1451,20 +1806,59 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
         self.method_types.get(&target).cloned()
     }
 
-    fn property_atom(
+    /// Чтение свойства: `prop:<class>::<p>` для известного типа, `key:<p>` для
+    /// неизвестного получателя; магический аксессор добавляет `key:<p>` к may.
+    fn property_read(
         &self,
         object: &Expression<'a>,
         property: &ClassLikeMemberSelector<'a>,
-    ) -> Option<String> {
+    ) -> (Vec<String>, Vec<String>) {
         let ClassLikeMemberSelector::Identifier(property) = property else {
-            return None;
+            return (vec!["unknown".into()], Vec::new());
         };
         let name = lossy(property.value);
-        if is_this(object) {
-            return Some(format!("prop:this::{name}"));
+        let (class, atom) = if is_this(object) {
+            let class = self.class.clone();
+            let atom = "prop:this".to_string();
+            (class, atom)
+        } else {
+            match self.type_of(object) {
+                Some(class) => (Some(class.clone()), format!("prop:{class}")),
+                // Получатель неизвестен: читается колонка/ключ того же имени.
+                None => return (vec![format!("key:{name}")], Vec::new()),
+            }
+        };
+        let prop = format!("{atom}::{name}");
+        let mut origins = vec![prop.clone()];
+        if class
+            .as_ref()
+            .is_some_and(|class| self.magic.contains(class))
+        {
+            origins.push(format!("key:{name}"));
         }
-        self.type_of(object)
-            .map(|class| format!("prop:{class}::{name}"))
+        (origins, vec![prop])
+    }
+
+    /// `Foo::$x` / `self::$x` / `static::$x` / `parent::$x` → `prop:<class>::$x`.
+    fn static_property_atom(&self, access: &StaticPropertyAccess<'a>) -> Option<String> {
+        let Variable::Direct(variable) = &access.property else {
+            return None;
+        };
+        let class = self.class_name(access.class)?;
+        Some(format!("prop:{class}::{}", lossy(variable.name)))
+    }
+
+    /// Сравнение переменной-ключа со строковым литералом: `('' $k …)`.
+    fn key_literal(&self, lhs: &Expression<'a>, rhs: &Expression<'a>) -> Option<String> {
+        let (variable, literal) = match direct_var_name(lhs) {
+            Some(name) => (name, rhs),
+            None => (direct_var_name(rhs)?, lhs),
+        };
+        if !self.state.keys.contains(&variable) {
+            return None;
+        }
+        let (name, _) = self.literal_key(literal)?;
+        Some(name)
     }
 
     /// Литеральный ключ массива: (имя для `key:`, текст для `lhs`).
@@ -1489,6 +1883,15 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
 
     fn seed_params(&mut self, list: &FunctionLikeParameterList<'a>) {
         self.flow.params = list.parameters.len();
+        self.flow.param_names = list
+            .parameters
+            .iter()
+            .map(|parameter| {
+                lossy(parameter.variable.name)
+                    .trim_start_matches('$')
+                    .to_string()
+            })
+            .collect();
         for (index, parameter) in list.parameters.iter().enumerate() {
             let name = lossy(parameter.variable.name);
             let atom = format!("p:{}#{index}", self.method);
@@ -1664,6 +2067,14 @@ fn direct_var_name(expression: &Expression<'_>) -> Option<String> {
     }
 }
 
+/// Значение аргумента: позиционного или именованного.
+fn argument_value<'a>(argument: &Argument<'a>) -> &'a Expression<'a> {
+    match argument {
+        Argument::Positional(argument) => argument.value,
+        Argument::Named(argument) => argument.value,
+    }
+}
+
 /// Позиционные значения аргументов вызова.
 fn positional_values<'a>(list: &ArgumentList<'a>) -> Vec<&'a Expression<'a>> {
     list.arguments
@@ -1757,6 +2168,7 @@ fn merge_states(left: FlowState, right: FlowState) -> FlowState {
         }
     }
     let nulls = left.nulls.intersection(&right.nulls).cloned().collect();
+    let keys = left.keys.union(&right.keys).cloned().collect();
     let mut types = HashMap::new();
     for (name, ty) in &left.types {
         if right.types.get(name) == Some(ty) {
@@ -1769,6 +2181,8 @@ fn merge_states(left: FlowState, right: FlowState) -> FlowState {
         types,
         bools,
         nulls,
+        keys,
+        extracted: left.extracted || right.extracted,
         terminated: false,
     }
 }
@@ -2837,6 +3251,477 @@ class C
             ),
             "{:?}",
             run.args
+        );
+    }
+
+    #[test]
+    fn param_names_follow_params_order() {
+        let source = r#"<?php
+class C
+{
+    public function m($a, int $b): void
+    {
+    }
+}
+
+function f($x, $y): void
+{
+}
+"#;
+        let files = facts(source);
+        assert_eq!(method(&files, "C::m").param_names, vec!["a", "b"]);
+        assert_eq!(method(&files, "f").param_names, vec!["x", "y"]);
+    }
+
+    #[test]
+    fn named_and_spread_arguments_get_name_and_flag() {
+        let source = r#"<?php
+class C
+{
+    public function m($a, $b): void
+    {
+    }
+
+    public function run($x, $arr): void
+    {
+        $this->m(b: $x, a: $x);
+        $this->m(...$arr);
+    }
+}
+"#;
+        let files = facts(source);
+        let run = method(&files, "C::run");
+        assert!(
+            run.args.iter().any(|edge| edge.target == "C::m"
+                && edge.name.as_deref() == Some("b")
+                && edge.index == usize::MAX
+                && !edge.spread
+                && edge.origins.iter().any(|atom| atom == "p:C::run#0")),
+            "{:?}",
+            run.args
+        );
+        assert!(
+            run.args.iter().any(|edge| edge.target == "C::m"
+                && edge.spread
+                && edge.index == usize::MAX
+                && edge.origins.iter().any(|atom| atom == "p:C::run#1")),
+            "{:?}",
+            run.args
+        );
+    }
+
+    #[test]
+    fn unknown_receiver_property_read_becomes_key() {
+        let source = r#"<?php
+function f($row): void
+{
+    $x = $row->name_en;
+    if ($x) {
+    }
+}
+"#;
+        let files = facts(source);
+        let f = method(&files, "f");
+        let assign = f
+            .assigns
+            .iter()
+            .find(|assign| assign.lhs == "$x")
+            .expect("нет присваивания $x");
+        assert!(
+            assign.origins.iter().any(|atom| atom == "key:name_en"),
+            "{:?}",
+            assign.origins
+        );
+        assert!(
+            f.reads.iter().any(|read| read.expr == "$row->name_en"
+                && read.origins.iter().any(|atom| atom == "key:name_en")),
+            "{:?}",
+            f.reads
+        );
+    }
+
+    #[test]
+    fn magic_accessor_adds_key_to_property_read() {
+        let source = r#"<?php
+class Magic
+{
+    public function __get($name)
+    {
+        return 1;
+    }
+
+    public function __set($name, $value): void
+    {
+    }
+}
+
+class C
+{
+    public function run(Magic $obj): void
+    {
+        $x = $obj->name_en;
+    }
+}
+"#;
+        let files = facts(source);
+        let run = method(&files, "C::run");
+        let assign = run
+            .assigns
+            .iter()
+            .find(|assign| assign.lhs == "$x")
+            .expect("нет присваивания $x");
+        assert!(
+            assign
+                .origins
+                .iter()
+                .any(|atom| atom == "prop:Magic::name_en"),
+            "{:?}",
+            assign.origins
+        );
+        assert!(
+            assign.origins.iter().any(|atom| atom == "key:name_en"),
+            "{:?}",
+            assign.origins
+        );
+    }
+
+    #[test]
+    fn extract_makes_unknown_variable_a_key() {
+        let source = r#"<?php
+function f($row): void
+{
+    extract($row);
+    $x = $name_en;
+    if ($x) {
+    }
+}
+"#;
+        let files = facts(source);
+        let f = method(&files, "f");
+        let assign = f
+            .assigns
+            .iter()
+            .find(|assign| assign.lhs == "$x")
+            .expect("нет присваивания $x");
+        assert!(
+            assign.origins.iter().any(|atom| atom == "key:name_en"),
+            "{:?}",
+            assign.origins
+        );
+        assert!(
+            f.reads.iter().any(|read| read.expr == "$name_en"
+                && read.origins.iter().any(|atom| atom == "key:name_en")),
+            "{:?}",
+            f.reads
+        );
+    }
+
+    #[test]
+    fn get_object_vars_and_compact_union_origins() {
+        let source = r#"<?php
+class C
+{
+    private $a;
+    public $b;
+
+    public function run(): void
+    {
+        $vars = get_object_vars($this);
+    }
+}
+
+function f($a, $b): void
+{
+    $x = compact('a', 'b');
+}
+"#;
+        let files = facts(source);
+        let run = method(&files, "C::run");
+        let vars = run
+            .assigns
+            .iter()
+            .find(|assign| assign.lhs == "$vars")
+            .expect("нет присваивания $vars");
+        for atom in ["prop:this::a", "prop:this::b"] {
+            assert!(
+                vars.origins.iter().any(|origin| origin == atom),
+                "{atom}: {:?}",
+                vars.origins
+            );
+        }
+        let f = method(&files, "f");
+        let x = f
+            .assigns
+            .iter()
+            .find(|assign| assign.lhs == "$x")
+            .expect("нет присваивания $x");
+        for atom in ["p:f#0", "p:f#1"] {
+            assert!(
+                x.origins.iter().any(|origin| origin == atom),
+                "{atom}: {:?}",
+                x.origins
+            );
+        }
+    }
+
+    #[test]
+    fn match_value_unions_arm_origins() {
+        let source = r#"<?php
+function f($row, $kind)
+{
+    $x = match ($kind) {
+        'a' => $row['col_a'],
+        default => $row['col_b'],
+    };
+    if ($x) {
+    }
+}
+"#;
+        let files = facts(source);
+        let f = method(&files, "f");
+        let assign = f
+            .assigns
+            .iter()
+            .find(|assign| assign.lhs == "$x")
+            .expect("нет присваивания $x");
+        for atom in ["key:col_a", "key:col_b"] {
+            assert!(
+                assign.origins.iter().any(|origin| origin == atom),
+                "{atom}: {:?}",
+                assign.origins
+            );
+        }
+        let read = f
+            .reads
+            .iter()
+            .find(|read| read.expr == "$x")
+            .expect("нет чтения $x");
+        assert!(
+            read.origins.iter().any(|atom| atom == "key:col_a"),
+            "{:?}",
+            read.origins
+        );
+        assert!(read.must.is_empty(), "{:?}", read.must);
+    }
+
+    #[test]
+    fn switch_cases_fall_through_sequentially() {
+        let source = r#"<?php
+function f($mode, $row)
+{
+    switch ($mode) {
+        case 'a':
+            $x = $row['from_a'];
+        case 'b':
+            if ($x) {
+            }
+            break;
+    }
+}
+"#;
+        let files = facts(source);
+        let f = method(&files, "f");
+        let read = f
+            .reads
+            .iter()
+            .find(|read| read.expr == "$x")
+            .expect("нет чтения $x во втором случае");
+        assert!(
+            read.origins.iter().any(|atom| atom == "key:from_a"),
+            "{:?}",
+            read.origins
+        );
+    }
+
+    #[test]
+    fn array_passthrough_functions_keep_origins() {
+        let source = r#"<?php
+function f($rows)
+{
+    $names = array_values(array_filter($rows));
+    $merged = array_merge($rows, array_slice($rows, 0, 2));
+}
+"#;
+        let files = facts(source);
+        let f = method(&files, "f");
+        for lhs in ["$names", "$merged"] {
+            let assign = f
+                .assigns
+                .iter()
+                .find(|assign| assign.lhs == lhs)
+                .unwrap_or_else(|| panic!("нет присваивания {lhs}"));
+            assert!(
+                assign.origins.iter().any(|atom| atom == "p:f#0"),
+                "{lhs}: {:?}",
+                assign.origins
+            );
+        }
+    }
+
+    #[test]
+    fn array_map_uses_callable_arrow_closure_and_arrays() {
+        let source = r#"<?php
+class C
+{
+    public function m($v)
+    {
+        return $v;
+    }
+
+    public function run($rows): void
+    {
+        $a = array_map([$this, 'm'], $rows);
+        $b = array_map(fn($r) => $r['col_fn'], $rows);
+        $c = array_map(function ($r) { return $r['col_closure']; }, $rows);
+        $d = array_map(null, $rows);
+    }
+}
+"#;
+        let files = facts(source);
+        let run = method(&files, "C::run");
+        let origins = |lhs: &str| {
+            run.assigns
+                .iter()
+                .find(|assign| assign.lhs == lhs)
+                .unwrap_or_else(|| panic!("нет присваивания {lhs}"))
+                .origins
+                .clone()
+        };
+        assert!(
+            origins("$a").iter().any(|atom| atom.starts_with("c:C::m@")),
+            "{:?}",
+            origins("$a")
+        );
+        assert!(
+            origins("$b").iter().any(|atom| atom == "key:col_fn"),
+            "{:?}",
+            origins("$b")
+        );
+        assert!(
+            origins("$c").iter().any(|atom| atom == "key:col_closure"),
+            "{:?}",
+            origins("$c")
+        );
+        assert!(
+            origins("$d").iter().any(|atom| atom == "p:C::run#0"),
+            "{:?}",
+            origins("$d")
+        );
+    }
+
+    #[test]
+    fn static_property_read_and_write_use_class_atom() {
+        let source = r#"<?php
+class C
+{
+    private static $count;
+
+    public function run($x): void
+    {
+        $v = self::$count;
+        self::$count = $x;
+    }
+}
+"#;
+        let files = facts(source);
+        let run = method(&files, "C::run");
+        let read = run
+            .assigns
+            .iter()
+            .find(|assign| assign.lhs == "$v")
+            .expect("нет присваивания $v");
+        assert!(
+            read.origins.iter().any(|atom| atom == "prop:C::$count"),
+            "{:?}",
+            read.origins
+        );
+        let write = run
+            .assigns
+            .iter()
+            .find(|assign| assign.lhs == "prop:C::$count")
+            .expect("нет присваивания статического свойства");
+        assert_eq!(write.origins, vec!["p:C::run#0".to_string()]);
+    }
+
+    #[test]
+    fn global_variable_reads_and_writes_global_property() {
+        let source = r#"<?php
+class C
+{
+    public function set($value): void
+    {
+        global $counter;
+        $counter = $value;
+        $x = $counter;
+    }
+}
+"#;
+        let files = facts(source);
+        let set = method(&files, "C::set");
+        assert!(
+            set.assigns
+                .iter()
+                .any(|assign| assign.lhs == "prop:global::counter"
+                    && assign.origins.iter().any(|atom| atom == "p:C::set#0")),
+            "{:?}",
+            set.assigns
+        );
+        let x = set
+            .assigns
+            .iter()
+            .find(|assign| assign.lhs == "$x")
+            .expect("нет присваивания $x");
+        assert!(
+            x.origins.iter().any(|atom| atom == "prop:global::counter"),
+            "{:?}",
+            x.origins
+        );
+    }
+
+    #[test]
+    fn foreach_key_compared_with_literal_records_key_read() {
+        let source = r#"<?php
+function f($map): void
+{
+    foreach ($map as $key => $value) {
+        if ($key === 'service_type') {
+        }
+    }
+}
+"#;
+        let files = facts(source);
+        let f = method(&files, "f");
+        assert!(
+            f.reads
+                .iter()
+                .any(|read| read.origins.iter().any(|atom| atom == "key:service_type")),
+            "{:?}",
+            f.reads
+        );
+    }
+
+    #[test]
+    fn reference_assignment_copies_origins() {
+        let source = r#"<?php
+function f($row): void
+{
+    $b = $row['name_en'];
+    $a = &$b;
+    if ($a) {
+    }
+}
+"#;
+        let files = facts(source);
+        let f = method(&files, "f");
+        let assign = f
+            .assigns
+            .iter()
+            .find(|assign| assign.lhs == "$a")
+            .expect("нет присваивания $a");
+        assert!(
+            assign.origins.iter().any(|atom| atom == "key:name_en"),
+            "{:?}",
+            assign.origins
         );
     }
 }

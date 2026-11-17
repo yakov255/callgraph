@@ -65,6 +65,12 @@ pub struct Index {
     args: HashMap<(String, usize), BTreeSet<String>>,
     /// Истоки аргументов по (цель вызова, сайт `file#line`, индекс аргумента).
     site_args: HashMap<(String, String, usize), BTreeSet<String>>,
+    /// Имена параметров по id метода: имя (без `$`) → индекс (для именованных аргументов).
+    param_index: HashMap<String, HashMap<String, usize>>,
+    /// Истоки spread-аргументов по (цель вызова, сайт `file#line`); пустой сайт — все сайты цели.
+    spread_args: HashMap<(String, String), BTreeSet<String>>,
+    /// `must`-истоки spread-аргументов по (цель вызова, сайт `file#line`).
+    spread_must: HashMap<(String, String), BTreeSet<String>>,
     /// `must`-истоки возвратов по id метода (пересечение всех `return`).
     returns_must: HashMap<String, BTreeSet<String>>,
     /// `must`-истоки аргументов по (цель вызова, индекс аргумента).
@@ -123,6 +129,22 @@ impl Index {
             children.sort();
             children.dedup();
         }
+        // Имена параметров нужны разбору аргументов — собираем их до основных фактов.
+        for file in files {
+            for method in &file.methods {
+                if method.param_names.is_empty() {
+                    continue;
+                }
+                let names = index.param_index.entry(method.id.clone()).or_default();
+                for (position, name) in method.param_names.iter().enumerate() {
+                    names
+                        .entry(name.trim_start_matches('$').to_string())
+                        .or_insert(position);
+                }
+            }
+        }
+        // Кэш разбора именованных аргументов: (цель, имя) → индекс параметра.
+        let mut named_cache: HashMap<(String, String), Option<usize>> = HashMap::new();
         for file in files {
             for method in &file.methods {
                 let container = method.container.as_deref();
@@ -196,24 +218,63 @@ impl Index {
                         .iter()
                         .map(|origin| qualify(origin, &file.file, container))
                         .collect();
+                    // Spread может питать любой параметр: позиции у него нет, храним по сайту
+                    // и суммарно по цели (пустой сайт) для глобального раскрытия `p:`.
+                    if arg.spread {
+                        index
+                            .spread_args
+                            .entry((arg.target.clone(), site.clone()))
+                            .or_default()
+                            .extend(origins.iter().cloned());
+                        index
+                            .spread_args
+                            .entry((arg.target.clone(), String::new()))
+                            .or_default()
+                            .extend(origins.iter().cloned());
+                        must_merge(
+                            &mut index.spread_must,
+                            (arg.target.clone(), site.clone()),
+                            must.clone(),
+                        );
+                        must_merge(
+                            &mut index.spread_must,
+                            (arg.target.clone(), String::new()),
+                            must,
+                        );
+                        continue;
+                    }
+                    // Именованный аргумент: позиция — по имени параметра цели; неизвестное имя отбрасывается.
+                    let index_at = match &arg.name {
+                        Some(name) => {
+                            let name = name.trim_start_matches('$').to_string();
+                            let resolved = named_cache
+                                .entry((arg.target.clone(), name.clone()))
+                                .or_insert_with(|| index.param_index_of(&arg.target, &name));
+                            let Some(position) = *resolved else {
+                                continue;
+                            };
+                            position
+                        }
+                        None => arg.index,
+                    };
                     index
                         .args
-                        .entry((arg.target.clone(), arg.index))
+                        .entry((arg.target.clone(), index_at))
                         .or_default()
                         .extend(origins.iter().cloned());
                     index
                         .site_args
-                        .entry((arg.target.clone(), site.clone(), arg.index))
+                        .entry((arg.target.clone(), site.clone(), index_at))
                         .or_default()
                         .extend(origins);
                     must_merge(
                         &mut index.args_must,
-                        (arg.target.clone(), arg.index),
+                        (arg.target.clone(), index_at),
                         must.clone(),
                     );
                     must_merge(
                         &mut index.site_args_must,
-                        (arg.target.clone(), site, arg.index),
+                        (arg.target.clone(), site, index_at),
                         must,
                     );
                 }
@@ -346,8 +407,8 @@ impl Index {
                     // Собственный параметр метода (в т.ч. унаследованного с тем же именем):
                     // аргументы именно этого вызова; их отсутствие — пустой набор, не глобальные.
                     if same_method(param_target, target) {
-                        if let Some(args) = self.site_args_for(target, site, index) {
-                            set.extend(args.iter().cloned());
+                        if let Some(args) = self.call_args(target, site, index) {
+                            set.extend(args);
                         }
                         continue;
                     }
@@ -424,9 +485,9 @@ impl Index {
             if let Some((param_target, index)) = parse_param(origin)
                 && same_method(param_target, target)
             {
-                if let Some(args) = self.site_args_for(target, site, index) {
+                if let Some(args) = self.call_args(target, site, index) {
                     for arg in args {
-                        set.extend(self.expand_closure(arg, ctx, depth));
+                        set.extend(self.expand_closure(&arg, ctx, depth));
                     }
                 }
                 continue;
@@ -476,8 +537,8 @@ impl Index {
                 if let Some((param_target, index)) = parse_param(origin)
                     && same_method(param_target, target)
                 {
-                    if let Some(args) = self.site_args_for(target, site, index) {
-                        set.extend(args.iter().cloned());
+                    if let Some(args) = self.call_args(target, site, index) {
+                        set.extend(args);
                     }
                     continue;
                 }
@@ -488,9 +549,9 @@ impl Index {
         if let Some(rest) = atom.strip_prefix("p:")
             && let Some((target, index)) = rest.rsplit_once('#')
             && let Ok(index) = index.parse::<usize>()
-            && let Some(set) = self.args_for(target, index)
+            && let Some(set) = self.param_args(target, index)
         {
-            return set.clone();
+            return set;
         }
         BTreeSet::new()
     }
@@ -664,10 +725,10 @@ impl Index {
                         if let Some((param_target, index)) = parse_param(origin)
                             && same_method(param_target, target)
                         {
-                            if let Some(args) = self.site_args_for(target, site, index) {
+                            if let Some(args) = self.call_args(target, site, index) {
                                 for arg in args {
                                     entry.extend(self.expand_allocation(
-                                        arg,
+                                        &arg,
                                         &class,
                                         &allocation_site,
                                         0,
@@ -704,16 +765,16 @@ impl Index {
                 .rsplit_once("::")
                 .is_some_and(|(owner, method)| owner == class && method == "__construct");
             if own_constructor {
-                if let Some(args) = self.site_args_for(target, site, index) {
+                if let Some(args) = self.call_args(target, site, index) {
                     for arg in args {
-                        set.extend(self.expand_allocation(arg, class, site, depth + 1));
+                        set.extend(self.expand_allocation(&arg, class, site, depth + 1));
                     }
                 }
                 return set;
             }
-            if let Some(args) = self.args_for(target, index) {
+            if let Some(args) = self.param_args(target, index) {
                 for arg in args {
-                    set.extend(self.expand_allocation(arg, class, site, depth + 1));
+                    set.extend(self.expand_allocation(&arg, class, site, depth + 1));
                 }
                 return set;
             }
@@ -759,6 +820,14 @@ impl Index {
 
     /// Транзитивные потомки `class`, определяющие `<Child>::<method>` (точный id).
     fn descendant_method_ids(&self, class: &str, method: &str) -> Vec<String> {
+        self.descendant_ids_where(class, method, |id| self.returns.contains_key(id))
+    }
+
+    /// Транзитивные потомки `class`, у которых `<Child>::<method>` удовлетворяет `exists`.
+    fn descendant_ids_where<F>(&self, class: &str, method: &str, exists: F) -> Vec<String>
+    where
+        F: Fn(&str) -> bool,
+    {
         let mut ids = Vec::new();
         let mut queue = VecDeque::new();
         let mut visited = BTreeSet::new();
@@ -773,7 +842,7 @@ impl Index {
                     continue;
                 }
                 let id = format!("{child}::{method}");
-                if self.returns.contains_key(&id) {
+                if exists(&id) {
                     ids.push(id);
                 }
                 queue.push_back(child.clone());
@@ -842,6 +911,76 @@ impl Index {
     fn site_args_for(&self, target: &str, site: &str, index: usize) -> Option<&BTreeSet<String>> {
         self.site_args
             .get(&(target.to_string(), site.to_string(), index))
+    }
+
+    /// Spread-истоки сайта `(цель, сайт)`; пустой сайт — все сайты цели.
+    fn spread_for(&self, target: &str, site: &str) -> Option<&BTreeSet<String>> {
+        self.spread_args
+            .get(&(target.to_string(), site.to_string()))
+    }
+
+    /// `must`-spread-истоки сайта `(цель, сайт)`; пустой сайт — все сайты цели.
+    fn spread_must_for(&self, target: &str, site: &str) -> Option<&BTreeSet<String>> {
+        self.spread_must
+            .get(&(target.to_string(), site.to_string()))
+    }
+
+    /// Аргументы параметра на сайте: позиция/имя плюс spread этого сайта (spread питает любой параметр).
+    fn call_args(&self, target: &str, site: &str, index: usize) -> Option<BTreeSet<String>> {
+        merge_spread(
+            self.site_args_for(target, site, index),
+            self.spread_for(target, site),
+        )
+    }
+
+    /// Глобальные аргументы параметра плюс spread всех сайтов цели.
+    fn param_args(&self, target: &str, index: usize) -> Option<BTreeSet<String>> {
+        merge_spread(self.args_for(target, index), self.spread_for(target, ""))
+    }
+
+    /// `must`-аргументы параметра на сайте плюс `must`-spread этого сайта.
+    fn call_args_must(&self, target: &str, site: &str, index: usize) -> Option<BTreeSet<String>> {
+        merge_spread(
+            self.site_args_must_for(target, site, index),
+            self.spread_must_for(target, site),
+        )
+    }
+
+    /// `must`-аргументы параметра (глобально) плюс `must`-spread всех сайтов цели.
+    fn param_args_must(&self, target: &str, index: usize) -> Option<BTreeSet<String>> {
+        merge_spread(
+            self.args_must_for(target, index),
+            self.spread_must_for(target, ""),
+        )
+    }
+
+    /// Индекс параметра по имени: точный id, иначе предок с этим именем, иначе потомок.
+    fn param_index_of(&self, target: &str, name: &str) -> Option<usize> {
+        if let Some(position) = self
+            .param_index
+            .get(target)
+            .and_then(|names| names.get(name))
+        {
+            return Some(*position);
+        }
+        let (class, method) = target.rsplit_once("::")?;
+        if let Some(id) = self.ancestor_method(class, method, |id| self.has_param(id, name)) {
+            return self.param_index.get(&id)?.get(name).copied();
+        }
+        // Интерфейс/трейт: имя параметра берём у первой реализации-потомка.
+        for id in self.descendant_ids_where(class, method, |id| self.has_param(id, name)) {
+            if let Some(position) = self.param_index.get(&id).and_then(|names| names.get(name)) {
+                return Some(*position);
+            }
+        }
+        None
+    }
+
+    /// Есть ли у метода параметр с таким именем.
+    fn has_param(&self, id: &str, name: &str) -> bool {
+        self.param_index
+            .get(id)
+            .is_some_and(|names| names.contains_key(name))
     }
 
     /// Истоки возвратов метода: точный id, иначе первый родитель с точным `Родитель::метод`.
@@ -994,9 +1133,9 @@ impl Index {
             return set;
         }
         if let Some((target, index)) = parse_param(atom) {
-            if let Some(args) = self.args_must_for(target, index) {
+            if let Some(args) = self.param_args_must(target, index) {
                 for arg in args {
-                    set.extend(self.must_expand(arg, depth + 1));
+                    set.extend(self.must_expand(&arg, depth + 1));
                 }
             }
             return set;
@@ -1013,11 +1152,11 @@ impl Index {
                 // Параметр своего вызова — аргументы именно этого сайта, иначе глобальные.
                 let args = site
                     .filter(|_| same_method(param_target, target))
-                    .and_then(|site| self.site_args_must_for(target, site, index))
-                    .or_else(|| self.args_must_for(param_target, index));
+                    .and_then(|site| self.call_args_must(target, site, index))
+                    .or_else(|| self.param_args_must(param_target, index));
                 if let Some(args) = args {
                     for arg in args {
-                        set.extend(self.must_expand(arg, depth + 1));
+                        set.extend(self.must_expand(&arg, depth + 1));
                     }
                 }
                 continue;
@@ -1135,6 +1274,21 @@ impl Index {
         }
         None
     }
+}
+
+/// Объединение аргументов параметра со spread-истоками; `None` — данных нет вовсе.
+fn merge_spread(
+    args: Option<&BTreeSet<String>>,
+    spread: Option<&BTreeSet<String>>,
+) -> Option<BTreeSet<String>> {
+    if args.is_none() && spread.is_none() {
+        return None;
+    }
+    let mut set = args.cloned().unwrap_or_default();
+    if let Some(extra) = spread {
+        set.extend(extra.iter().cloned());
+    }
+    Some(set)
 }
 
 /// Конструктор ли метод (его записи `$this->p` привязаны к аргументам места создания).
@@ -1410,6 +1564,8 @@ mod tests {
             index,
             origins: origins.iter().map(|origin| (*origin).to_string()).collect(),
             must: Vec::new(),
+            name: None,
+            spread: false,
         }
     }
 
@@ -1420,6 +1576,34 @@ mod tests {
             index,
             origins: origins.iter().map(|origin| (*origin).to_string()).collect(),
             must: must.iter().map(|origin| (*origin).to_string()).collect(),
+            name: None,
+            spread: false,
+        }
+    }
+
+    /// Именованный аргумент: позиции нет, имя параметра цели.
+    fn arg_named(line: u32, target: &str, name: &str, origins: &[&str]) -> ArgEdge {
+        ArgEdge {
+            line,
+            target: target.into(),
+            index: usize::MAX,
+            origins: origins.iter().map(|origin| (*origin).to_string()).collect(),
+            must: Vec::new(),
+            name: Some(name.into()),
+            spread: false,
+        }
+    }
+
+    /// Spread-аргумент: `foo(...$args)` питает любой параметр.
+    fn arg_spread(line: u32, target: &str, origins: &[&str]) -> ArgEdge {
+        ArgEdge {
+            line,
+            target: target.into(),
+            index: usize::MAX,
+            origins: origins.iter().map(|origin| (*origin).to_string()).collect(),
+            must: Vec::new(),
+            name: None,
+            spread: true,
         }
     }
 
@@ -2101,5 +2285,118 @@ mod tests {
         let traces = index.traces("name_en");
         assert_eq!(traces.len(), 1, "{traces:#?}");
         assert_eq!(traces[0].column, "sql:items.name_en");
+    }
+
+    /// Именованный аргумент `new Item(name: $key)` попадает в `p:Item::__construct#0`.
+    #[test]
+    fn named_argument_resolves_by_name() {
+        let mut ctor = method("Item::__construct");
+        ctor.container = Some("Item".into());
+        ctor.params = 1;
+        ctor.param_names = vec!["name".into()];
+        ctor.assigns
+            .push(assign(3, "prop:this::name", &["p:Item::__construct#0"]));
+        let mut getter = method("Item::getName");
+        getter.container = Some("Item".into());
+        getter
+            .returns
+            .push(read(7, "$this->name", &["prop:this::name"]));
+        let mut run = method("A::run");
+        run.args
+            .push(arg_named(20, "Item::__construct", "name", &["key:name_en"]));
+        run.receivers
+            .push(receiver(20, "Item::getName", &["new:Item@20"]));
+        run.reads
+            .push(read(20, "$a->getName()", &["c:Item::getName@20"]));
+        // Прямое чтение параметра: имя аргумента разрешилось в индекс 0.
+        run.reads
+            .push(read(21, "$name", &["p:Item::__construct#0"]));
+        let index = Index::build(&[file("a.php", vec![ctor, getter, run])]);
+
+        let traces = index.traces("name_en");
+        assert_eq!(traces.len(), 2, "{traces:#?}");
+        assert!(traces.iter().all(|trace| has(trace, "key:name_en")));
+        assert!(traces.iter().any(|trace| trace.line == 20));
+        assert!(
+            traces
+                .iter()
+                .any(|trace| trace.line == 21 && has(trace, "p:Item::__construct#0"))
+        );
+    }
+
+    /// Неизвестное имя именованного аргумента отбрасывается: параметр истоков не получает.
+    #[test]
+    fn unknown_argument_name_is_ignored() {
+        let mut ctor = method("Item::__construct");
+        ctor.container = Some("Item".into());
+        ctor.params = 1;
+        ctor.param_names = vec!["name".into()];
+        ctor.assigns
+            .push(assign(3, "prop:this::name", &["p:Item::__construct#0"]));
+        let mut getter = method("Item::getName");
+        getter.container = Some("Item".into());
+        getter
+            .returns
+            .push(read(7, "$this->name", &["prop:this::name"]));
+        let mut run = method("A::run");
+        run.args.push(arg_named(
+            20,
+            "Item::__construct",
+            "missing",
+            &["key:name_en"],
+        ));
+        run.receivers
+            .push(receiver(20, "Item::getName", &["new:Item@20"]));
+        run.reads
+            .push(read(20, "$a->getName()", &["c:Item::getName@20"]));
+        let index = Index::build(&[file("a.php", vec![ctor, getter, run])]);
+
+        assert!(index.traces("name_en").is_empty());
+    }
+
+    /// Spread `foo(...$rows)` питает любой параметр, в т.ч. не первый, на своём сайте и глобально.
+    #[test]
+    fn spread_feeds_every_parameter() {
+        let mut set = method("H::set");
+        set.params = 2;
+        set.param_names = vec!["a".into(), "b".into()];
+        set.returns.push(read(1, "$a", &["p:H::set#0"]));
+        set.returns.push(read(2, "$b", &["p:H::set#1"]));
+        let mut run = method("A::run");
+        run.args.push(arg_spread(9, "H::set", &["key:name_en"]));
+        run.reads.push(read(10, "$x", &["c:H::set@9"]));
+        run.reads.push(read(11, "$y", &["p:H::set#1"]));
+        let index = Index::build(&[file("a.php", vec![set, run])]);
+
+        let traces = index.traces("name_en");
+        assert_eq!(traces.len(), 2, "{traces:#?}");
+        // Вызов на сайте 9 раскрывается spread-аргументом своего сайта.
+        assert!(
+            traces
+                .iter()
+                .any(|trace| trace.line == 10 && has(trace, "c:H::set"))
+        );
+        // Прямой `p:H::set#1` берёт spread глобально.
+        assert!(
+            traces
+                .iter()
+                .any(|trace| trace.line == 11 && has(trace, "p:H::set#1"))
+        );
+        assert!(traces.iter().all(|trace| has(trace, "key:name_en")));
+    }
+
+    /// Spread другого сайта не подмешивается: на своём сайте аргументов нет — цепочки нет.
+    #[test]
+    fn spread_does_not_leak_across_sites() {
+        let mut set = method("H::set");
+        set.params = 1;
+        set.param_names = vec!["a".into()];
+        set.returns.push(read(1, "$a", &["p:H::set#0"]));
+        let mut run = method("A::run");
+        run.args.push(arg_spread(9, "H::set", &["key:name_en"]));
+        run.reads.push(read(12, "$x", &["c:H::set@12"]));
+        let index = Index::build(&[file("a.php", vec![set, run])]);
+
+        assert!(index.traces("name_en").is_empty());
     }
 }
