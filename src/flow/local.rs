@@ -471,12 +471,88 @@ struct FlowState {
     bools: HashMap<String, bool>,
     /// Переменные, гарантированно равные `null`.
     nulls: HashSet<String>,
+    /// Известные ключи массива по базовой переменной: `$row` -> {`name_en`}.
+    offsets: HashMap<String, HashSet<String>>,
     /// Переменные-ключи `foreach ($row as $k => $v)`.
     keys: HashSet<String>,
     /// После `extract($arr)` неизвестная переменная читается как `key:<name>`.
     extracted: bool,
     /// Путь завершён (`return`): до конца блока записи не идут.
     terminated: bool,
+}
+
+/// Вид кадра переходов: цикл или `switch`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JumpKind {
+    Loop,
+    Switch,
+}
+
+/// Кадр `break`/`continue`: состояния выходов текущей конструкции.
+#[derive(Debug, Clone)]
+struct JumpFrame {
+    kind: JumpKind,
+    /// Состояния на `break` (и `continue` внутри `switch`).
+    breaks: Vec<FlowState>,
+    /// Состояния на `continue` цикла: вливаются в обратное ребро.
+    continues: Vec<FlowState>,
+}
+
+impl JumpFrame {
+    fn new(kind: JumpKind) -> Self {
+        Self {
+            kind,
+            breaks: Vec::new(),
+            continues: Vec::new(),
+        }
+    }
+}
+
+/// Итог одной итерации цикла: обратное ребро и путь выхода по условию.
+struct Iteration {
+    back: Option<FlowState>,
+    exit: Option<FlowState>,
+}
+
+/// Границы уже записанных фактов: повторный проход тела цикла не должен
+/// дублировать чтения и рёбра.
+struct FlowMark {
+    assigns: usize,
+    reads: usize,
+    returns: usize,
+    args: usize,
+    receivers: usize,
+}
+
+impl FlowMark {
+    fn new(flow: &MethodFlow) -> Self {
+        Self {
+            assigns: flow.assigns.len(),
+            reads: flow.reads.len(),
+            returns: flow.returns.len(),
+            args: flow.args.len(),
+            receivers: flow.receivers.len(),
+        }
+    }
+
+    /// Оставить из дописанного только то, чего не было: повтор тела цикла
+    /// видит те же узлы, поэтому точные дубликаты отбрасываются.
+    fn dedupe(&self, flow: &mut MethodFlow) {
+        dedupe_tail(&mut flow.assigns, self.assigns);
+        dedupe_tail(&mut flow.reads, self.reads);
+        dedupe_tail(&mut flow.returns, self.returns);
+        dedupe_tail(&mut flow.args, self.args);
+        dedupe_tail(&mut flow.receivers, self.receivers);
+    }
+}
+
+fn dedupe_tail<T: PartialEq>(items: &mut Vec<T>, keep: usize) {
+    let tail: Vec<T> = items.split_off(keep);
+    for item in tail {
+        if !items.contains(&item) {
+            items.push(item);
+        }
+    }
 }
 
 /// Факты файла и класса, нужные анализатору: магические аксессоры и свойства.
@@ -509,6 +585,8 @@ struct Analyzer<'p, 'a, 't> {
     props: Vec<String>,
     /// Переменные, объявленные через `global` в этом методе.
     globals: HashSet<String>,
+    /// Стек конструкций с `break`/`continue`.
+    jumps: Vec<JumpFrame>,
     flow: MethodFlow,
 }
 
@@ -542,6 +620,7 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
             magic: class_facts.magic,
             props: class_facts.props,
             globals: HashSet::new(),
+            jumps: Vec::new(),
         }
     }
 
@@ -558,39 +637,13 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
         match statement {
             Statement::Block(block) => self.statements(block.statements.as_slice()),
             Statement::If(node) => self.if_statement(node),
-            Statement::While(node) => {
-                let before = self.state.clone();
-                self.condition(node.condition);
-                self.statements(node.body.statements());
-                self.loop_join(before);
-            }
-            Statement::DoWhile(node) => {
-                self.statement(node.statement);
-                if self.state.terminated {
-                    return;
-                }
-                self.condition(node.condition);
-            }
-            Statement::For(node) => {
-                for expression in node.initializations.iter() {
-                    self.expression_statement(expression);
-                }
-                let before = self.state.clone();
-                for expression in node.conditions.iter() {
-                    self.condition(expression);
-                }
-                for expression in node.increments.iter() {
-                    self.expression_statement(expression);
-                }
-                self.statements(node.body.statements());
-                self.loop_join(before);
-            }
-            Statement::Foreach(node) => {
-                let before = self.state.clone();
-                self.foreach(node);
-                self.loop_join(before);
-            }
+            Statement::While(node) => self.while_statement(node),
+            Statement::DoWhile(node) => self.do_while_statement(node),
+            Statement::For(node) => self.for_statement(node),
+            Statement::Foreach(node) => self.foreach_statement(node),
             Statement::Switch(node) => self.switch_statement(node),
+            Statement::Break(node) => self.break_statement(node.level),
+            Statement::Continue(node) => self.continue_statement(node.level),
             Statement::Global(node) => {
                 for variable in node.variables.iter() {
                     let Variable::Direct(variable) = variable else {
@@ -643,6 +696,7 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
     }
 
     /// Цепочка условий: первое выполнимое, иначе следующее, иначе `else`.
+    /// Условие уточняет состояние: `then` — истинные факты, `else` — ложные.
     fn chain(
         &mut self,
         branches: &[(&Expression<'a>, &[Statement<'a>])],
@@ -655,21 +709,31 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
             return;
         };
         self.condition(condition);
-        match self.decide(condition) {
+        let truthy = self.narrow(condition, true);
+        let falsey = self.narrow(condition, false);
+        match self.truth_value(condition) {
             // Статически известно значение: невыполнимые ветки не идут вовсе.
-            Some(true) => self.branch(body),
-            Some(false) => self.chain(rest, otherwise),
+            Some(true) => {
+                self.state = truthy;
+                self.branch(body);
+            }
+            Some(false) => {
+                self.state = falsey;
+                self.chain(rest, otherwise);
+            }
             None if !self.can_fork() => {
                 let before = self.state.clone();
+                self.state = truthy;
                 self.branch(body);
+                self.state = falsey;
                 self.chain(rest, otherwise);
                 self.conservative_after(&before);
             }
             None => {
-                let snapshot = self.state.clone();
+                self.state = truthy;
                 self.branch(body);
                 let then_state = self.state.clone();
-                self.state = snapshot;
+                self.state = falsey;
                 self.chain(rest, otherwise);
                 let else_state = self.state.clone();
                 self.state = merge_states(then_state, else_state);
@@ -690,30 +754,606 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
         self.depth < MAX_DEPTH && self.paths < MAX_PATHS
     }
 
-    /// Слияние тела цикла с путём «ноль итераций»: may union, must intersection.
-    fn loop_join(&mut self, before: FlowState) {
-        let after = self.state.clone();
-        self.state = merge_states(before, after);
+    // -- циклы --------------------------------------------------------------
+
+    /// `while`: условие проверяется перед каждой итерацией.
+    fn while_statement(&mut self, node: &While<'a>) {
+        let before = self.state.clone();
+        let zero = (!self.truth_value(node.condition).unwrap_or(false)).then(|| before.clone());
+        self.loop_fixpoint(before.clone(), zero, true, false, |this| {
+            this.condition(node.condition);
+            let exit = (!this.state.terminated)
+                .then(|| this.narrow_state(&this.state, node.condition, false));
+            this.state = this.narrow_state(&this.state, node.condition, true);
+            if this.state.terminated {
+                return Iteration { back: None, exit };
+            }
+            this.statements(node.body.statements());
+            let back = (!this.state.terminated).then(|| this.state.clone());
+            Iteration { back, exit }
+        });
+        self.generalize_loop(&before, &written_vars(node.body.statements()));
     }
 
-    /// `switch`: случаи идут последовательно (fallthrough), поэтому более
-    /// поздний случай видит состояние предыдущего. Без `default` возможен путь
-    /// «ни один случай не сработал»: слияние всего fallthrough с исходным
-    /// состоянием (may union, must intersection).
+    /// `do-while`: тело исполняется хотя бы раз, поэтому путь «ноль итераций»
+    /// отсутствует, а присваивания тела сохраняют `must`.
+    fn do_while_statement(&mut self, node: &DoWhile<'a>) {
+        let entry = self.state.clone();
+        self.loop_fixpoint(entry, None, false, false, |this| {
+            this.statement(node.statement);
+            if this.state.terminated {
+                return Iteration {
+                    back: None,
+                    exit: None,
+                };
+            }
+            this.condition(node.condition);
+            let exit = this.narrow_state(&this.state, node.condition, false);
+            let back = this.narrow_state(&this.state, node.condition, true);
+            Iteration {
+                back: Some(back),
+                exit: Some(exit),
+            }
+        });
+    }
+
+    /// `for`: инициализация один раз, условие и инкременты на каждой итерации.
+    fn for_statement(&mut self, node: &For<'a>) {
+        for expression in node.initializations.iter() {
+            self.expression_statement(expression);
+        }
+        let before = self.state.clone();
+        let always = node
+            .conditions
+            .iter()
+            .all(|condition| self.truth_value(condition) == Some(true));
+        let zero = (!node.conditions.is_empty() && !always).then(|| before.clone());
+        self.loop_fixpoint(before.clone(), zero, true, false, |this| {
+            let mut exit: Option<FlowState> = None;
+            for expression in node.conditions.iter() {
+                this.condition(expression);
+                let falsey = this.narrow_state(&this.state, expression, false);
+                exit = Some(join_state_value(exit, falsey));
+                this.state = this.narrow_state(&this.state, expression, true);
+            }
+            if this.state.terminated {
+                return Iteration { back: None, exit };
+            }
+            this.statements(node.body.statements());
+            if !this.state.terminated {
+                for expression in node.increments.iter() {
+                    this.expression_statement(expression);
+                }
+            }
+            let back = (!this.state.terminated).then(|| this.state.clone());
+            Iteration { back, exit }
+        });
+        self.generalize_loop(&before, &written_vars(node.body.statements()));
+    }
+
+    /// `foreach`: истоки элемента — итерируемое, ключ — `keys`.
+    fn foreach_statement(&mut self, node: &Foreach<'a>) {
+        let before = self.state.clone();
+        // Итерируемое вычисляется один раз: повторные проходы тела не должны
+        // дублировать чтения и рёбра аргументов.
+        let iterable = self.origins(node.expression);
+        let iterable_must = self.origins_must(node.expression);
+        let element = self.type_of(node.expression);
+        self.loop_fixpoint(before.clone(), Some(before.clone()), true, true, |this| {
+            if let Some(name) = direct_var_name(node.target.value()) {
+                this.set_var(&name, &iterable, &iterable_must);
+                this.state.offsets.remove(&name);
+                this.state.bools.remove(&name);
+                this.state.nulls.remove(&name);
+                if let Some(element) = &element {
+                    this.state.types.insert(name, element.clone());
+                }
+            }
+            if let Some(key) = node.target.key()
+                && let Some(name) = direct_var_name(key)
+            {
+                this.set_var(&name, &["unknown".to_string()], &[]);
+                this.state.keys.insert(name);
+            }
+            this.statements(node.body.statements());
+            let back = (!this.state.terminated).then(|| this.state.clone());
+            Iteration { back, exit: None }
+        });
+        self.generalize_loop(&before, &written_vars(node.body.statements()));
+    }
+
+    /// Неподвижная точка цикла: 2–3 прохода тела от слитого состояния.
+    /// `head` — состояние входа в итерацию, `zero` — путь «ноль итераций»,
+    /// `merge_head` — сливать ли вход с обратным ребром (`false` для `do-while`),
+    /// `head_exits` — выход из цикла равен голове после последней итерации
+    /// (`foreach`: условие проверять нечем).
+    fn loop_fixpoint<F>(
+        &mut self,
+        head: FlowState,
+        zero: Option<FlowState>,
+        merge_head: bool,
+        head_exits: bool,
+        mut iteration: F,
+    ) where
+        F: FnMut(&mut Self) -> Iteration,
+    {
+        self.jumps.push(JumpFrame::new(JumpKind::Loop));
+        let mut head = head;
+        let mut exits: Option<FlowState> = None;
+        let mut exit_paths: Option<FlowState> = None;
+        for pass in 0..3 {
+            self.state = head.clone();
+            let mark = FlowMark::new(&self.flow);
+            let step = iteration(self);
+            if pass > 0 {
+                mark.dedupe(&mut self.flow);
+            }
+            let (breaks, continues) = self.drain_jumps();
+            for state in breaks {
+                join_state(&mut exits, state);
+            }
+            if let Some(state) = step.exit {
+                join_state(&mut exit_paths, state);
+            }
+            let mut back = step.back;
+            for state in continues {
+                back = Some(match back {
+                    Some(current) => merge_states(current, state),
+                    None => state,
+                });
+            }
+            let Some(back) = back else {
+                break;
+            };
+            let next = if merge_head {
+                merge_states(head.clone(), back)
+            } else {
+                back
+            };
+            let grew = origins_grew(&head, &next);
+            head = next;
+            if !grew {
+                break;
+            }
+        }
+        self.jumps.pop();
+        let mut post = exits;
+        if let Some(zero) = zero {
+            join_state(&mut post, zero);
+        }
+        let has_exit = exit_paths.is_some();
+        if let Some(exit) = exit_paths {
+            join_state(&mut post, exit);
+        }
+        // Голова фиксированной точки — состояние после последней итерации.
+        // Для `foreach` это единственный выход; для `while`/`for` он есть
+        // только когда условие может стать ложным.
+        if head_exits || has_exit {
+            join_state(&mut post, head.clone());
+        }
+        match post {
+            Some(state) => self.state = state,
+            None => {
+                self.state = head;
+                self.state.terminated = true;
+            }
+        }
+    }
+
+    /// После цикла: у записанных в теле переменных `must` — только общий для
+    /// входа и итераций; остальные сохраняют факты входа.
+    fn generalize_loop(&mut self, entry: &FlowState, written: &HashSet<String>) {
+        if self.state.terminated {
+            return;
+        }
+        for name in written {
+            let entry_must = entry.must.get(name).cloned().unwrap_or_default();
+            let current = self.state.must.get(name).cloned().unwrap_or_default();
+            let common = intersect(&entry_must, &current);
+            if common.is_empty() {
+                self.state.must.remove(name);
+            } else {
+                self.state.must.insert(name.clone(), common);
+            }
+        }
+    }
+
+    fn drain_jumps(&mut self) -> (Vec<FlowState>, Vec<FlowState>) {
+        match self.jumps.last_mut() {
+            Some(frame) => (
+                std::mem::take(&mut frame.breaks),
+                std::mem::take(&mut frame.continues),
+            ),
+            None => (Vec::new(), Vec::new()),
+        }
+    }
+
+    fn jump_level(&self, level: Option<&Expression<'a>>) -> usize {
+        let Some(level) = level else {
+            return 1;
+        };
+        match level.unparenthesized() {
+            Expression::Literal(Literal::Integer(integer)) => integer
+                .value
+                .map(|value| value.max(1) as usize)
+                .unwrap_or(1),
+            _ => 1,
+        }
+    }
+
+    /// `break [n]`: состояние уходит в выход цели, путь завершается.
+    fn break_statement(&mut self, level: Option<&Expression<'a>>) {
+        let level = self.jump_level(level);
+        let state = self.state.clone();
+        match self.jumps.len().checked_sub(level) {
+            Some(index) => {
+                self.jumps[index].breaks.push(state);
+            }
+            None => {
+                // Уровень за пределами вложенности: пишем в ближайший кадр,
+                // путь всё равно завершается.
+                if let Some(frame) = self.jumps.last_mut() {
+                    frame.breaks.push(state);
+                }
+            }
+        }
+        self.state.terminated = true;
+    }
+
+    /// `continue [n]`: `continue 1` в `switch` равносилен `break` этого switch.
+    fn continue_statement(&mut self, level: Option<&Expression<'a>>) {
+        let level = self.jump_level(level);
+        let mut remaining = level;
+        let mut target = None;
+        for index in (0..self.jumps.len()).rev() {
+            remaining -= 1;
+            if remaining == 0 {
+                target = Some(index);
+                break;
+            }
+        }
+        let state = self.state.clone();
+        match target {
+            Some(index) => match self.jumps[index].kind {
+                JumpKind::Loop => self.jumps[index].continues.push(state),
+                JumpKind::Switch if level == 1 => self.jumps[index].breaks.push(state),
+                JumpKind::Switch => {
+                    // `continue 2` из switch внутри цикла: ищем цикл выше.
+                    if let Some(loop_index) = (0..index)
+                        .rev()
+                        .find(|&i| self.jumps[i].kind == JumpKind::Loop)
+                    {
+                        self.jumps[loop_index].continues.push(state);
+                    } else if let Some(frame) = self.jumps.last_mut() {
+                        frame.breaks.push(state);
+                    }
+                }
+            },
+            None => {
+                if let Some(frame) = self.jumps.last_mut() {
+                    frame.breaks.push(state);
+                }
+            }
+        }
+        self.state.terminated = true;
+    }
+
+    // -- уточнение условий --------------------------------------------------
+
+    /// Состояние после условия: копия с фактами `truthy`.
+    fn narrow(&self, expression: &Expression<'a>, truthy: bool) -> FlowState {
+        self.narrow_state(&self.state, expression, truthy)
+    }
+
+    fn narrow_state(
+        &self,
+        state: &FlowState,
+        expression: &Expression<'a>,
+        truthy: bool,
+    ) -> FlowState {
+        let mut state = state.clone();
+        self.apply_narrow(&mut state, expression, truthy);
+        state
+    }
+
+    fn apply_narrow(&self, state: &mut FlowState, expression: &Expression<'a>, truthy: bool) {
+        match expression.unparenthesized() {
+            Expression::Parenthesized(inner) => self.apply_narrow(state, inner.expression, truthy),
+            Expression::UnaryPrefix(unary)
+                if matches!(unary.operator, UnaryPrefixOperator::Not(_)) =>
+            {
+                self.apply_narrow(state, unary.operand, !truthy);
+            }
+            Expression::Variable(Variable::Direct(variable)) => {
+                let name = lossy(variable.name);
+                if state.bools.contains_key(&name) {
+                    state.bools.insert(name, truthy);
+                }
+            }
+            Expression::Binary(binary) => self.apply_binary_narrow(state, binary, truthy),
+            Expression::Construct(Construct::Isset(node)) => {
+                self.apply_isset_narrow(state, &node.values, truthy);
+            }
+            Expression::Construct(Construct::Empty(node)) => {
+                if !truthy && let Some(name) = direct_var_name(node.value) {
+                    state.nulls.remove(&name);
+                }
+            }
+            Expression::Call(call) => self.apply_call_narrow(state, call, truthy),
+            _ => {}
+        }
+    }
+
+    fn apply_binary_narrow(&self, state: &mut FlowState, binary: &Binary<'a>, truthy: bool) {
+        match binary.operator {
+            BinaryOperator::And(_) | BinaryOperator::LowAnd(_) => {
+                if truthy {
+                    // Оба истинны: уточнения применяются последовательно.
+                    self.apply_narrow(state, binary.lhs, true);
+                    self.apply_narrow(state, binary.rhs, true);
+                } else {
+                    // Ложно левое или ложно правое при истинном левом.
+                    let mut left = state.clone();
+                    self.apply_narrow(&mut left, binary.lhs, false);
+                    let mut right = state.clone();
+                    self.apply_narrow(&mut right, binary.lhs, true);
+                    self.apply_narrow(&mut right, binary.rhs, false);
+                    *state = merge_states(left, right);
+                }
+            }
+            BinaryOperator::Or(_) | BinaryOperator::LowOr(_) => {
+                if truthy {
+                    // Истинно левое или истинно правое при ложном левом.
+                    let mut left = state.clone();
+                    self.apply_narrow(&mut left, binary.lhs, true);
+                    let mut right = state.clone();
+                    self.apply_narrow(&mut right, binary.lhs, false);
+                    self.apply_narrow(&mut right, binary.rhs, true);
+                    *state = merge_states(left, right);
+                } else {
+                    self.apply_narrow(state, binary.lhs, false);
+                    self.apply_narrow(state, binary.rhs, false);
+                }
+            }
+            BinaryOperator::Identical(_) | BinaryOperator::NotIdentical(_) => {
+                let identical = matches!(binary.operator, BinaryOperator::Identical(_));
+                self.apply_equality_narrow(state, binary.lhs, binary.rhs, identical == truthy);
+            }
+            BinaryOperator::Instanceof(_) => {
+                let Expression::Variable(Variable::Direct(variable)) = binary.lhs.unparenthesized()
+                else {
+                    return;
+                };
+                let name = lossy(variable.name);
+                let class = self.class_name(binary.rhs);
+                if truthy {
+                    if let Some(class) = class {
+                        state.types.insert(name, class);
+                    }
+                } else if let Some(class) = class
+                    && state.types.get(&name) == Some(&class)
+                {
+                    state.types.remove(&name);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `$x === null` / `$x === true` / `$x === 'k'` и отрицания.
+    fn apply_equality_narrow(
+        &self,
+        state: &mut FlowState,
+        lhs: &Expression<'a>,
+        rhs: &Expression<'a>,
+        equal: bool,
+    ) {
+        if is_null_literal(rhs) || is_null_literal(lhs) {
+            let name = if is_null_literal(rhs) {
+                direct_var_name(lhs)
+            } else {
+                direct_var_name(rhs)
+            };
+            let Some(name) = name else {
+                return;
+            };
+            if equal {
+                state.nulls.insert(name);
+            } else {
+                state.nulls.remove(&name);
+            }
+            return;
+        }
+        let variable = direct_var_name(lhs).or_else(|| direct_var_name(rhs));
+        let Some(name) = variable else {
+            return;
+        };
+        let literal = if direct_var_name(lhs).is_some() {
+            rhs
+        } else {
+            lhs
+        };
+        match literal.unparenthesized() {
+            Expression::Literal(Literal::True(_)) if equal => {
+                state.bools.insert(name, true);
+            }
+            Expression::Literal(Literal::False(_)) if equal => {
+                state.bools.insert(name, false);
+            }
+            Expression::Literal(Literal::String(_)) | Expression::Literal(Literal::Integer(_))
+                if equal =>
+            {
+                state.bools.remove(&name);
+                state.nulls.remove(&name);
+            }
+            _ => {}
+        }
+    }
+
+    fn apply_isset_narrow(
+        &self,
+        state: &mut FlowState,
+        values: &TokenSeparatedSequence<'a, &'a Expression<'a>>,
+        truthy: bool,
+    ) {
+        for value in values.iter() {
+            if let Some(name) = direct_var_name(value) {
+                if truthy {
+                    state.nulls.remove(&name);
+                }
+                continue;
+            }
+            let Expression::ArrayAccess(access) = value.unparenthesized() else {
+                continue;
+            };
+            let Some(base) = direct_var_name(access.array) else {
+                continue;
+            };
+            let Some((key, _)) = self.literal_key(access.index) else {
+                continue;
+            };
+            let offsets = state.offsets.entry(base).or_default();
+            if truthy {
+                offsets.insert(key);
+            } else {
+                offsets.remove(&key);
+            }
+        }
+    }
+
+    /// `is_null($x)`, `array_key_exists('k', $a)` и их отрицания.
+    fn apply_call_narrow(&self, state: &mut FlowState, call: &Call<'a>, truthy: bool) {
+        let Some(target) = self.call_target(call) else {
+            return;
+        };
+        let short = target
+            .rsplit('\\')
+            .next()
+            .unwrap_or(&target)
+            .to_ascii_lowercase();
+        let arguments = positional_values(call.get_argument_list());
+        match short.as_str() {
+            "is_null" => {
+                let Some(value) = arguments.first() else {
+                    return;
+                };
+                let Some(name) = direct_var_name(value) else {
+                    return;
+                };
+                if truthy {
+                    state.nulls.insert(name);
+                } else {
+                    state.nulls.remove(&name);
+                }
+            }
+            "array_key_exists" => {
+                let (Some(key), Some(array)) = (arguments.first(), arguments.get(1)) else {
+                    return;
+                };
+                // Нелитеральный ключ ничего не уточняет.
+                let Some((key, _)) = self.literal_key(key) else {
+                    return;
+                };
+                let Some(base) = direct_var_name(array) else {
+                    return;
+                };
+                let offsets = state.offsets.entry(base).or_default();
+                if truthy {
+                    offsets.insert(key);
+                } else {
+                    offsets.remove(&key);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `switch`: реальный fallthrough. Каждый `case` стартует с текущего
+    /// fallthrough-состояния; `break`/`continue` завершают путь и отдают
+    /// состояние в выход, а следующий `case` снова стартует с состояния до
+    /// `switch`. Без `default` возможен путь «ничего не совпало».
     fn switch_statement(&mut self, node: &Switch<'a>) {
         self.condition(node.expression);
         let before = self.state.clone();
+        let subject = direct_var_name(node.expression);
         let has_default = node.body.has_default_case();
+        self.jumps.push(JumpFrame::new(JumpKind::Switch));
+        let mut exits: Option<FlowState> = None;
+        let mut fall = before.clone();
+        let mut last_fell = false;
         for case in node.body.cases() {
+            let mut entry = fall.clone();
+            entry.terminated = false;
+            let mut reachable = true;
             if let Some(expression) = case.expression() {
                 self.expression_statement(expression);
+                if let Some(subject) = &subject {
+                    reachable = self.apply_literal(&mut entry, subject, expression);
+                }
             }
+            self.state = entry;
             self.statements(case.statements());
+            let (breaks, _continues) = self.drain_jumps();
+            let terminated = self.state.terminated;
+            let end = (!terminated).then(|| self.state.clone());
+            if reachable {
+                for state in breaks {
+                    join_state(&mut exits, state);
+                }
+                fall = match (terminated, end) {
+                    (false, Some(end)) => end,
+                    _ => before.clone(),
+                };
+            } else {
+                fall = before.clone();
+            }
+            last_fell = reachable && !terminated;
+        }
+        self.jumps.pop();
+        let mut post = exits;
+        if last_fell {
+            join_state(&mut post, fall);
         }
         if !has_default {
-            let fallthrough = self.state.clone();
-            self.state = merge_states(fallthrough, before);
+            join_state(&mut post, before.clone());
         }
+        match post {
+            Some(state) => self.state = state,
+            None => {
+                self.state = before;
+                self.state.terminated = true;
+            }
+        }
+    }
+
+    /// Уточнить состояние при совпадении субъекта с литералом. `false` —
+    /// ветка недостижима (противоречие известным фактам).
+    fn apply_literal(&self, state: &mut FlowState, subject: &str, value: &Expression<'a>) -> bool {
+        match value.unparenthesized() {
+            Expression::Literal(Literal::True(_)) => {
+                if state.bools.get(subject) == Some(&false) {
+                    return false;
+                }
+                state.bools.insert(subject.to_string(), true);
+            }
+            Expression::Literal(Literal::False(_)) => {
+                if state.bools.get(subject) == Some(&true) {
+                    return false;
+                }
+                state.bools.insert(subject.to_string(), false);
+            }
+            Expression::Literal(Literal::Null(_)) => {
+                state.nulls.insert(subject.to_string());
+            }
+            Expression::Literal(Literal::String(_)) | Expression::Literal(Literal::Integer(_)) => {
+                if state.nulls.contains(subject) {
+                    return false;
+                }
+                state.bools.remove(subject);
+            }
+            _ => {}
+        }
+        true
     }
 
     /// `try` / `catch` / `finally`: тело `try` с текущего состояния, каждое
@@ -729,6 +1369,7 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
             if let Some(variable) = &clause.variable {
                 let name = lossy(variable.name);
                 self.set_var(&name, &["unknown".to_string()], &[]);
+                self.state.offsets.remove(&name);
                 if let Some(ty) = hint_type(self.parsed, &self.resolver, &clause.hint) {
                     self.state.types.insert(name, ty);
                 }
@@ -747,7 +1388,7 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
     }
 
     /// Статически известное значение условия, если его можно решить.
-    fn decide(&self, expression: &Expression<'a>) -> Option<bool> {
+    fn truth_value(&self, expression: &Expression<'a>) -> Option<bool> {
         match expression.unparenthesized() {
             Expression::Literal(Literal::True(_)) => Some(true),
             Expression::Literal(Literal::False(_)) => Some(false),
@@ -757,13 +1398,13 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
             Expression::UnaryPrefix(unary)
                 if matches!(unary.operator, UnaryPrefixOperator::Not(_)) =>
             {
-                self.decide(unary.operand).map(|value| !value)
+                self.truth_value(unary.operand).map(|value| !value)
             }
-            Expression::Parenthesized(inner) => self.decide(inner.expression),
+            Expression::Parenthesized(inner) => self.truth_value(inner.expression),
             Expression::Binary(binary) => match binary.operator {
-                BinaryOperator::Identical(_) => self.null_test(binary.lhs, binary.rhs),
+                BinaryOperator::Identical(_) => self.null_value(binary.lhs, binary.rhs),
                 BinaryOperator::NotIdentical(_) => {
-                    self.null_test(binary.lhs, binary.rhs).map(|value| !value)
+                    self.null_value(binary.lhs, binary.rhs).map(|value| !value)
                 }
                 _ => None,
             },
@@ -772,7 +1413,7 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
     }
 
     /// `$x === null`, где `$x` уже известен как `null` на текущем пути.
-    fn null_test(&self, lhs: &Expression<'a>, rhs: &Expression<'a>) -> Option<bool> {
+    fn null_value(&self, lhs: &Expression<'a>, rhs: &Expression<'a>) -> Option<bool> {
         let name = if is_null_literal(rhs) {
             direct_var_name(lhs)
         } else if is_null_literal(lhs) {
@@ -793,6 +1434,9 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
         self.state
             .types
             .retain(|name, ty| before.types.get(name) == Some(ty));
+        self.state
+            .offsets
+            .retain(|base, keys| before.offsets.get(base).is_some_and(|known| known == keys));
         let changed: Vec<String> = self
             .state
             .vars
@@ -837,25 +1481,6 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
                 must,
             });
         }
-    }
-
-    fn foreach(&mut self, node: &Foreach<'a>) {
-        let iterable = self.origins(node.expression);
-        let iterable_must = self.origins_must(node.expression);
-        let element = self.type_of(node.expression);
-        if let Some(name) = direct_var_name(node.target.value()) {
-            self.set_var(&name, &iterable, &iterable_must);
-            if let Some(element) = element {
-                self.state.types.insert(name, element);
-            }
-        }
-        if let Some(key) = node.target.key()
-            && let Some(name) = direct_var_name(key)
-        {
-            self.set_var(&name, &["unknown".to_string()], &[]);
-            self.state.keys.insert(name);
-        }
-        self.statements(node.body.statements());
     }
 
     // -- присваивания -------------------------------------------------------
@@ -1027,6 +1652,61 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
         norm(origins)
     }
 
+    /// `match`: каждое плечо стартует с состояния до `match`, уточнённого
+    /// литеральными условиями. Результат — union значений; `must` — только
+    /// при наличии `default`.
+    fn match_origins(&mut self, node: &Match<'a>) -> Vec<String> {
+        self.condition(node.expression);
+        let before = self.state.clone();
+        let subject = direct_var_name(node.expression);
+        let mut origins = Vec::new();
+        for arm in node.arms.iter() {
+            let mut entry = before.clone();
+            let mut reachable = true;
+            if let MatchArm::Expression(arm) = arm {
+                for condition in arm.conditions.iter() {
+                    self.origins(condition);
+                    if let Some(subject) = &subject {
+                        reachable &= self.apply_literal(&mut entry, subject, condition);
+                    }
+                }
+            }
+            self.state = entry;
+            let value = self.origins(arm.expression());
+            self.state = before.clone();
+            if reachable {
+                origins.extend(value);
+            }
+        }
+        self.state = before;
+        if origins.is_empty() {
+            vec!["unknown".into()]
+        } else {
+            norm(origins)
+        }
+    }
+
+    /// `must` результата `match`: все плечи должны совпасть, иначе пусто.
+    /// `default` обязателен: без него возможно «ни одно плечо».
+    fn match_must(&self, node: &Match<'a>) -> Vec<String> {
+        let has_default = node.arms.iter().any(|arm| arm.is_default());
+        if !has_default {
+            return Vec::new();
+        }
+        let mut arms: Vec<Vec<String>> = Vec::new();
+        for arm in node.arms.iter() {
+            arms.push(self.origins_must(arm.expression()));
+        }
+        let Some(first) = arms.first() else {
+            return Vec::new();
+        };
+        if arms.iter().all(|must| must == first) {
+            first.clone()
+        } else {
+            Vec::new()
+        }
+    }
+
     fn origins(&mut self, expression: &Expression<'a>) -> Vec<String> {
         match expression.unparenthesized() {
             Expression::Variable(Variable::Direct(variable)) => {
@@ -1119,23 +1799,7 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
                 origins.extend(self.origins(conditional.r#else));
                 norm(origins)
             }
-            Expression::Match(node) => {
-                self.condition(node.expression);
-                let mut origins = Vec::new();
-                for arm in node.arms.iter() {
-                    if let MatchArm::Expression(arm) = arm {
-                        for condition in arm.conditions.iter() {
-                            self.origins(condition);
-                        }
-                    }
-                    origins.extend(self.origins(arm.expression()));
-                }
-                if origins.is_empty() {
-                    vec!["unknown".into()]
-                } else {
-                    norm(origins)
-                }
-            }
+            Expression::Match(node) => self.match_origins(node),
             Expression::Construct(_) => vec!["unknown".into()],
             Expression::CompositeString(_) => vec!["lit".into()],
             Expression::Array(array) => self.array_origins(&array.elements),
@@ -1211,6 +1875,7 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
                 let otherwise = self.origins_must(conditional.r#else);
                 intersect(&then, &otherwise)
             }
+            Expression::Match(node) => self.match_must(node),
             _ => Vec::new(),
         }
     }
@@ -1927,6 +2592,7 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
             self.state.must.remove(&name);
             self.state.bools.remove(&name);
             self.state.nulls.remove(&name);
+            self.state.offsets.remove(&name);
         }
     }
 
@@ -1971,10 +2637,11 @@ impl<'p, 'a, 't> Analyzer<'p, 'a, 't> {
         }
     }
 
-    /// Булевы/`null`-факты после присваивания.
+    /// Булевы/`null`/ключевые факты после присваивания.
     fn facts(&mut self, name: &str, rhs: &Expression<'a>) {
         self.state.bools.remove(name);
         self.state.nulls.remove(name);
+        self.state.offsets.remove(name);
         match rhs.unparenthesized() {
             Expression::Literal(Literal::True(_)) => {
                 self.state.bools.insert(name.to_string(), true);
@@ -2168,6 +2835,16 @@ fn merge_states(left: FlowState, right: FlowState) -> FlowState {
         }
     }
     let nulls = left.nulls.intersection(&right.nulls).cloned().collect();
+    // Ключ гарантирован только там, где он известен на обоих путях.
+    let mut offsets: HashMap<String, HashSet<String>> = HashMap::new();
+    for (base, keys) in &left.offsets {
+        if let Some(other) = right.offsets.get(base) {
+            let common: HashSet<String> = keys.intersection(other).cloned().collect();
+            if !common.is_empty() {
+                offsets.insert(base.clone(), common);
+            }
+        }
+    }
     let keys = left.keys.union(&right.keys).cloned().collect();
     let mut types = HashMap::new();
     for (name, ty) in &left.types {
@@ -2181,6 +2858,7 @@ fn merge_states(left: FlowState, right: FlowState) -> FlowState {
         types,
         bools,
         nulls,
+        offsets,
         keys,
         extracted: left.extracted || right.extracted,
         terminated: false,
@@ -2193,6 +2871,285 @@ fn is_null_literal(expression: &Expression<'_>) -> bool {
         expression.unparenthesized(),
         Expression::Literal(Literal::Null(_))
     )
+}
+
+/// Слить состояние в накопитель: `None` заменяется, иначе may union.
+fn join_state(target: &mut Option<FlowState>, state: FlowState) {
+    *target = Some(join_state_value(target.take(), state));
+}
+
+fn join_state_value(current: Option<FlowState>, state: FlowState) -> FlowState {
+    match current {
+        Some(current) => merge_states(current, state),
+        None => state,
+    }
+}
+
+/// Появились ли в `after` истоки, которых не было в `before` (критерий
+/// остановки фиксированной точки цикла).
+fn origins_grew(before: &FlowState, after: &FlowState) -> bool {
+    after.vars.iter().any(|(name, atoms)| {
+        let known = before.vars.get(name);
+        atoms
+            .iter()
+            .any(|atom| known.is_none_or(|origins| !origins.contains(atom)))
+    })
+}
+
+/// Переменные, которые тело может записать (синтаксически): присваивания,
+/// `++`/`--`, привязки `foreach`, деструктуризация, переменные `catch`.
+fn written_vars(statements: &[Statement<'_>]) -> HashSet<String> {
+    let mut writes = HashSet::new();
+    for statement in statements {
+        collect_statement_writes(statement, &mut writes);
+    }
+    writes
+}
+
+fn collect_statement_writes(statement: &Statement<'_>, writes: &mut HashSet<String>) {
+    match statement {
+        Statement::Block(block) => {
+            for statement in block.statements.as_slice() {
+                collect_statement_writes(statement, writes);
+            }
+        }
+        Statement::If(node) => {
+            collect_expression_writes(node.condition, writes);
+            for statement in node.body.statements() {
+                collect_statement_writes(statement, writes);
+            }
+            for (condition, body) in node.body.else_if_clauses() {
+                collect_expression_writes(condition, writes);
+                for statement in body {
+                    collect_statement_writes(statement, writes);
+                }
+            }
+            if let Some(statements) = node.body.else_statements() {
+                for statement in statements {
+                    collect_statement_writes(statement, writes);
+                }
+            }
+        }
+        Statement::While(node) => {
+            collect_expression_writes(node.condition, writes);
+            for statement in node.body.statements() {
+                collect_statement_writes(statement, writes);
+            }
+        }
+        Statement::DoWhile(node) => {
+            collect_statement_writes(node.statement, writes);
+            collect_expression_writes(node.condition, writes);
+        }
+        Statement::For(node) => {
+            for expression in node.initializations.iter() {
+                collect_expression_writes(expression, writes);
+            }
+            for expression in node.conditions.iter() {
+                collect_expression_writes(expression, writes);
+            }
+            for expression in node.increments.iter() {
+                collect_expression_writes(expression, writes);
+            }
+            for statement in node.body.statements() {
+                collect_statement_writes(statement, writes);
+            }
+        }
+        Statement::Foreach(node) => {
+            collect_expression_writes(node.expression, writes);
+            collect_expression_writes(node.target.value(), writes);
+            if let Some(key) = node.target.key() {
+                collect_expression_writes(key, writes);
+            }
+            for statement in node.body.statements() {
+                collect_statement_writes(statement, writes);
+            }
+        }
+        Statement::Switch(node) => {
+            collect_expression_writes(node.expression, writes);
+            for case in node.body.cases() {
+                if let Some(expression) = case.expression() {
+                    collect_expression_writes(expression, writes);
+                }
+                for statement in case.statements() {
+                    collect_statement_writes(statement, writes);
+                }
+            }
+        }
+        Statement::Try(node) => {
+            for statement in node.block.statements.as_slice() {
+                collect_statement_writes(statement, writes);
+            }
+            for clause in node.catch_clauses.iter() {
+                if let Some(variable) = &clause.variable {
+                    writes.insert(lossy(variable.name));
+                }
+                for statement in clause.block.statements.as_slice() {
+                    collect_statement_writes(statement, writes);
+                }
+            }
+            if let Some(finally) = &node.finally_clause {
+                for statement in finally.block.statements.as_slice() {
+                    collect_statement_writes(statement, writes);
+                }
+            }
+        }
+        Statement::Global(node) => {
+            for variable in node.variables.iter() {
+                if let Variable::Direct(variable) = variable {
+                    writes.insert(lossy(variable.name));
+                }
+            }
+        }
+        Statement::Return(node) => {
+            if let Some(value) = node.value {
+                collect_expression_writes(value, writes);
+            }
+        }
+        Statement::Echo(node) => {
+            for value in node.values.iter() {
+                collect_expression_writes(value, writes);
+            }
+        }
+        Statement::Expression(node) => collect_expression_writes(node.expression, writes),
+        _ => {}
+    }
+}
+
+fn collect_expression_writes(expression: &Expression<'_>, writes: &mut HashSet<String>) {
+    match expression.unparenthesized() {
+        Expression::Assignment(node) => {
+            collect_expression_writes(node.rhs, writes);
+            collect_lhs_writes(node.lhs, writes);
+        }
+        Expression::UnaryPrefix(node)
+            if matches!(
+                node.operator,
+                UnaryPrefixOperator::PreIncrement(_) | UnaryPrefixOperator::PreDecrement(_)
+            ) =>
+        {
+            collect_lhs_writes(node.operand, writes);
+        }
+        Expression::UnaryPostfix(node)
+            if matches!(
+                node.operator,
+                UnaryPostfixOperator::PostIncrement(_) | UnaryPostfixOperator::PostDecrement(_)
+            ) =>
+        {
+            collect_lhs_writes(node.operand, writes);
+        }
+        Expression::Binary(node) => {
+            collect_expression_writes(node.lhs, writes);
+            collect_expression_writes(node.rhs, writes);
+        }
+        Expression::Conditional(node) => {
+            collect_expression_writes(node.condition, writes);
+            if let Some(then) = node.then {
+                collect_expression_writes(then, writes);
+            }
+            collect_expression_writes(node.r#else, writes);
+        }
+        Expression::Call(call) => {
+            match call {
+                Call::Method(node) => collect_expression_writes(node.object, writes),
+                Call::NullSafeMethod(node) => collect_expression_writes(node.object, writes),
+                Call::StaticMethod(node) => collect_expression_writes(node.class, writes),
+                Call::Function(_) => {}
+            }
+            for argument in call.get_argument_list().arguments.iter() {
+                collect_expression_writes(argument_value(argument), writes);
+            }
+        }
+        Expression::Instantiation(node) => {
+            if let Some(arguments) = &node.argument_list {
+                for argument in arguments.arguments.iter() {
+                    collect_expression_writes(argument_value(argument), writes);
+                }
+            }
+        }
+        Expression::ArrayAccess(node) => {
+            collect_expression_writes(node.array, writes);
+            collect_expression_writes(node.index, writes);
+        }
+        Expression::ArrayAppend(node) => collect_expression_writes(node.array, writes),
+        Expression::Array(node) => collect_element_writes(&node.elements, writes),
+        Expression::LegacyArray(node) => collect_element_writes(&node.elements, writes),
+        Expression::List(node) => collect_element_writes(&node.elements, writes),
+        Expression::Access(Access::Property(node)) => {
+            collect_expression_writes(node.object, writes)
+        }
+        Expression::Access(Access::NullSafeProperty(node)) => {
+            collect_expression_writes(node.object, writes)
+        }
+        Expression::Match(node) => {
+            collect_expression_writes(node.expression, writes);
+            for arm in node.arms.iter() {
+                if let MatchArm::Expression(arm) = arm {
+                    for condition in arm.conditions.iter() {
+                        collect_expression_writes(condition, writes);
+                    }
+                }
+                collect_expression_writes(arm.expression(), writes);
+            }
+        }
+        Expression::Yield(Yield::Value(node)) => {
+            if let Some(value) = node.value {
+                collect_expression_writes(value, writes);
+            }
+        }
+        Expression::Yield(Yield::Pair(node)) => {
+            collect_expression_writes(node.key, writes);
+            collect_expression_writes(node.value, writes);
+        }
+        Expression::Yield(Yield::From(node)) => collect_expression_writes(node.iterator, writes),
+        Expression::Parenthesized(node) => collect_expression_writes(node.expression, writes),
+        _ => {}
+    }
+}
+
+fn collect_element_writes(
+    elements: &TokenSeparatedSequence<'_, ArrayElement<'_>>,
+    writes: &mut HashSet<String>,
+) {
+    for element in elements.iter() {
+        match element {
+            ArrayElement::KeyValue(item) => {
+                collect_expression_writes(item.key, writes);
+                collect_expression_writes(item.value, writes);
+            }
+            ArrayElement::Value(item) => collect_expression_writes(item.value, writes),
+            ArrayElement::Variadic(item) => collect_expression_writes(item.value, writes),
+            ArrayElement::Missing(_) => {}
+        }
+    }
+}
+
+fn collect_lhs_writes(expression: &Expression<'_>, writes: &mut HashSet<String>) {
+    match expression.unparenthesized() {
+        Expression::Variable(Variable::Direct(variable)) => {
+            writes.insert(lossy(variable.name));
+        }
+        Expression::ArrayAccess(node) => {
+            if let Some(base) = direct_var_name(node.array) {
+                writes.insert(base);
+            }
+            collect_lhs_writes(node.array, writes);
+            collect_expression_writes(node.index, writes);
+        }
+        Expression::ArrayAppend(node) => {
+            if let Some(base) = direct_var_name(node.array) {
+                writes.insert(base);
+            }
+        }
+        Expression::Access(Access::Property(node)) if is_this(node.object) => {
+            if let ClassLikeMemberSelector::Identifier(property) = &node.property {
+                writes.insert(format!("this->{}", lossy(property.value)));
+            }
+        }
+        Expression::Array(node) => collect_element_writes(&node.elements, writes),
+        Expression::LegacyArray(node) => collect_element_writes(&node.elements, writes),
+        Expression::List(node) => collect_element_writes(&node.elements, writes),
+        _ => {}
+    }
 }
 
 /// Применить `use`-импорты файла к резолверу.
@@ -3722,6 +4679,178 @@ function f($row): void
             assign.origins.iter().any(|atom| atom == "key:name_en"),
             "{:?}",
             assign.origins
+        );
+    }
+
+    #[test]
+    fn isset_narrows_the_nullable_variable() {
+        let source = r#"<?php
+function f($row): void
+{
+    $x = $row['name_en'] ?? null;
+    if ($x !== null) {
+        if ($x) {
+        }
+    }
+    if (isset($row['name_en'])) {
+        if ($row['name_en']) {
+        }
+    }
+}
+"#;
+        let files = facts(source);
+        let f = method(&files, "f");
+        let read = f
+            .reads
+            .iter()
+            .find(|read| read.expr == "$x")
+            .expect("нет чтения $x");
+        assert!(
+            read.origins.iter().any(|atom| atom == "key:name_en"),
+            "{:?}",
+            read.origins
+        );
+        assert!(
+            f.reads.iter().any(|read| read.expr == "$row['name_en']"
+                && read.origins.iter().any(|atom| atom == "key:name_en")),
+            "{:?}",
+            f.reads
+        );
+    }
+
+    #[test]
+    fn array_key_exists_narrows_the_offset() {
+        let source = r#"<?php
+function f($row): void
+{
+    if (array_key_exists('name_en', $row)) {
+        if ($row['name_en']) {
+        }
+    }
+}
+"#;
+        let files = facts(source);
+        let f = method(&files, "f");
+        let read = f
+            .reads
+            .iter()
+            .find(|read| read.expr == "$row['name_en']")
+            .expect("нет чтения $row['name_en']");
+        assert!(
+            read.origins.iter().any(|atom| atom == "key:name_en"),
+            "{:?}",
+            read.origins
+        );
+    }
+
+    #[test]
+    fn loop_fixpoint_reaches_the_second_iteration() {
+        let source = r#"<?php
+function f($row, $c): void
+{
+    $x = 'a';
+    while ($c) {
+        $x = $row['name_en'];
+        $c = false;
+    }
+    if ($x) {
+    }
+}
+"#;
+        let files = facts(source);
+        let f = method(&files, "f");
+        let read = f
+            .reads
+            .iter()
+            .find(|read| read.expr == "$x")
+            .expect("нет чтения $x");
+        assert!(
+            read.origins.iter().any(|atom| atom == "key:name_en"),
+            "{:?}",
+            read.origins
+        );
+    }
+
+    #[test]
+    fn switch_break_ends_fallthrough() {
+        let source = r#"<?php
+function f($mode, $row): void
+{
+    switch ($mode) {
+        case 'a':
+            $x = $row['from_a'];
+            break;
+        case 'b':
+            if ($x) {
+            }
+            break;
+    }
+}
+"#;
+        let files = facts(source);
+        let f = method(&files, "f");
+        assert!(
+            f.reads
+                .iter()
+                .all(|read| read.expr != "$x"
+                    || !read.origins.iter().any(|atom| atom == "key:from_a")),
+            "{:?}",
+            f.reads
+        );
+    }
+
+    #[test]
+    fn match_arms_union_origins() {
+        let source = r#"<?php
+function f($row, $kind): void
+{
+    $x = match ($kind) {
+        'a' => $row['name_en'],
+        default => 'x',
+    };
+    if ($x) {
+    }
+}
+"#;
+        let files = facts(source);
+        let f = method(&files, "f");
+        let read = f
+            .reads
+            .iter()
+            .find(|read| read.expr == "$x")
+            .expect("нет чтения $x");
+        assert!(
+            read.origins.iter().any(|atom| atom == "key:name_en"),
+            "{:?}",
+            read.origins
+        );
+        assert!(read.must.is_empty(), "{:?}", read.must);
+    }
+
+    #[test]
+    fn match_all_arms_must() {
+        let source = r#"<?php
+function f($row, $kind): void
+{
+    $x = match ($kind) {
+        'a' => $row['name_en'],
+        default => $row['name_en'],
+    };
+    if ($x) {
+    }
+}
+"#;
+        let files = facts(source);
+        let f = method(&files, "f");
+        let read = f
+            .reads
+            .iter()
+            .find(|read| read.expr == "$x")
+            .expect("нет чтения $x");
+        assert!(
+            read.must.iter().any(|atom| atom == "key:name_en"),
+            "{:?}",
+            read.must
         );
     }
 }
