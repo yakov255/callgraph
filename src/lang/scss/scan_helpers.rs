@@ -262,6 +262,16 @@ mod tests {
     }
 
     #[test]
+    fn multibyte_text_does_not_panic_the_scanner() {
+        // регрессия: индекс `i` попадал в середину многобайтового символа (`•`, кириллица) → паника char boundary
+        let src = "// • Кириллица · текст\n.a {\n  color: red;\n}\n$after: 1px;\n";
+        assert_eq!(
+            constants("utf.scss", src),
+            vec![("$after".to_owned(), "1px".to_owned())]
+        );
+    }
+
+    #[test]
     fn all_golden_samples_finish() {
         for name in [
             "_helpers.scss",
