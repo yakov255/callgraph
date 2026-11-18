@@ -113,6 +113,7 @@ pub fn build_command(args: CliArgs) -> Result<Box<dyn Command>> {
             json,
             crate::skill::SkillHome::from_env(),
         ))),
+        CliArgs::Skills { full } => Ok(Box::new(commands::SkillsCommand::new(full))),
         CliArgs::Refs { id, key, project } => Ok(Box::new(commands::RefsCommand::new(
             id,
             key,

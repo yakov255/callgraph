@@ -8,6 +8,10 @@ Angol változat: [CHANGELOG.md](CHANGELOG.md) — a kettő tartalma azonos.
 
 ### Új
 
+- **Agent-felület:** `map` (a `locate` álneve), `read <fájl[::metódus]>` (fájl → outline, metódus → törzs
+  típus-lábjegyzetekkel alapból; `--body`, `--api`, `--flow`, `--lines`), `find def|callers|string|const`,
+  `flow` (alapból trace, a `flow map` változatlan) és `skills get [--full]` (a beépített, verzióhoz illő skill).
+  A régi parancsok álnevekként megmaradnak.
 - **Típus-lábjegyzetek a `--body` kimenetben (`--refs`)** és a `refs <rN> <k>` parancs: a metódus törzse a szignatúra
   nevesített típusai után `[#k]` jelölőt kap; a lábjegyzet-blokk megadja az osztályt és a fájlját, a `refs` pedig a
   class forrását mutatja a saját jelölőivel — a `?ErrorLogEntity` → konstruktor `?Throwable` lánc lépésenként nyílik.

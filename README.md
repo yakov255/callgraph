@@ -232,9 +232,20 @@ All commands go through `callgraph.sh` (or the binary directly: `callgraph show 
 relative to a registered project root; `--project <dir>` (an existing folder, absolute or relative) works without
 registering; without it, the current directory is the root.
 
+For agents there is a smaller surface over the same engine: `map` (locate), `read` (file → outline,
+`file::method` → body with type footnotes), `find def|callers|string|const`, `flow` (trace) and `skills get`.
+The older commands below stay as aliases.
+
 | Task | Command |
 |---|---|
-| Where do I start with this task? | `callgraph.sh locate <term>... [--all]` |
+| Where do I start with this task? | `callgraph map <term>... [--all]` (alias `locate`) |
+| Read a file / one method | `callgraph read <file[::method]> [--body\|--api\|--flow\|--lines N-M]` |
+| Method body with type footnotes | `callgraph read <file>::<method>` · expand: `callgraph refs <rN> <k>` |
+| Who calls it / impact | `callgraph find callers <name> [--depth N]` |
+| String / constant | `callgraph find string <text>` · `callgraph find const <NAME>` |
+| Class file via composer autoload | `callgraph autoload <FQCN>... [--project <alias>]` |
+| Built-in skill | `callgraph skills get [--full]` |
+| Where do I start with this task? (old form) | `callgraph.sh locate <term>... [--all]` |
 | Outline of a file / directory | `callgraph.sh <file\|dir>` |
 | One method only | `callgraph.sh <file>::<method>` (several selectors allowed) |
 | Method source, line-numbered | `callgraph.sh <file>::<method> --body` |

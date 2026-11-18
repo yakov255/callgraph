@@ -7,6 +7,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions: [Sem
 
 ### Added
 
+- **Agent surface:** `map` (alias `locate`), `read <file[::method]>` (file → outline, method → body with type
+  footnotes by default; `--body`, `--api`, `--flow`, `--lines`), `find def|callers|string|const`,
+  `flow` (trace by default, `flow map` unchanged) and `skills get [--full]` (the built-in, version-matched skill).
+  The older commands stay as aliases.
 - **Type footnotes in `--body` (`--refs`)** and the `refs <rN> <k>` command: a method body gets `[#k]` markers after
   named types in its signature; the footnote block names the class and its file, and `refs` shows the class source with
   its own markers — chains such as `?ErrorLogEntity` → its constructor's `?Throwable` open step by step. Docblock

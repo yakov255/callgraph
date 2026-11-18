@@ -17,8 +17,8 @@ use super::uses_args::{parse_deps, parse_uses};
 
 fn usage() -> &'static str {
     crate::t!(
-        "callgraph [--lang <id,...>] [--cache <file>] [--no-cache] <file|dir> [...] | callgraph prune [--cache <file>] [--dry-run] | callgraph set-lang [en|hu] | callgraph self-update [--check] | callgraph note add|list|rm … | callgraph refresh [--project <alias|dir>] [--background] [<path>…] | callgraph locate <term>... [--all] [--project <alias|dir>] | callgraph hook install|uninstall|status | callgraph stats [--events] [--days N] | callgraph flow map [--project <alias|dir>] [--json] [--table <name>] [--full] | callgraph trace <term>... [--project <alias|dir>] [--json] [--full] [--must] | callgraph autoload <Class>... [--project <alias|dir>] [--json] | callgraph refs <rN> <k> [--project <alias|dir>] | callgraph mcp [--auto-update] | callgraph --version  (any command: --no-gitignore = ignore the .gitignore files)",
-        "callgraph [--lang <id,...>] [--cache <fájl>] [--no-cache] <fájl|mappa> [...] | callgraph prune [--cache <fájl>] [--dry-run] | callgraph set-lang [en|hu] | callgraph self-update [--check] | callgraph note add|list|rm … | callgraph refresh [--project <alias|mappa>] [--background] [<út>…] | callgraph locate <kifejezés>... [--all] [--project <alias|mappa>] | callgraph hook install|uninstall|status | callgraph stats [--events] [--days N] | callgraph flow map [--project <alias|mappa>] [--json] [--table <név>] [--full] | callgraph trace <kifejezés>... [--project <alias|mappa>] [--json] [--full] [--must] | callgraph autoload <Osztály>... [--project <alias|mappa>] [--json] | callgraph refs <rN> <k> [--project <alias|mappa>] | callgraph mcp [--auto-update] | callgraph --version  (bármely parancsnál: --no-gitignore = a .gitignore fájlok nélkül)"
+        "callgraph [--lang <id,...>] [--cache <file>] [--no-cache] <file|dir> [...] | callgraph prune [--cache <file>] [--dry-run] | callgraph set-lang [en|hu] | callgraph self-update [--check] | callgraph note add|list|rm … | callgraph refresh [--project <alias|dir>] [--background] [<path>…] | callgraph locate <term>... [--all] [--project <alias|dir>] | callgraph hook install|uninstall|status | callgraph stats [--events] [--days N] | callgraph flow map [--project <alias|dir>] [--json] [--table <name>] [--full] | callgraph trace <term>... [--project <alias|dir>] [--json] [--full] [--must] | callgraph map <term>... | callgraph read <path[::method]> [--body|--api|--flow|--lines N-M] | callgraph find <def|callers|string|const> <value> | callgraph flow <term>... | callgraph skills get [--full] | callgraph autoload <Class>... [--project <alias|dir>] [--json] | callgraph refs <rN> <k> [--project <alias|dir>] | callgraph mcp [--auto-update] | callgraph --version  (any command: --no-gitignore = ignore the .gitignore files)",
+        "callgraph [--lang <id,...>] [--cache <fájl>] [--no-cache] <fájl|mappa> [...] | callgraph prune [--cache <fájl>] [--dry-run] | callgraph set-lang [en|hu] | callgraph self-update [--check] | callgraph note add|list|rm … | callgraph refresh [--project <alias|mappa>] [--background] [<út>…] | callgraph locate <kifejezés>... [--all] [--project <alias|mappa>] | callgraph hook install|uninstall|status | callgraph stats [--events] [--days N] | callgraph flow map [--project <alias|mappa>] [--json] [--table <név>] [--full] | callgraph trace <kifejezés>... [--project <alias|mappa>] [--json] [--full] [--must] | callgraph map <kifejezés>... | callgraph read <út[::metódus]> [--body|--api|--flow|--lines N-M] | callgraph find <def|callers|string|const> <érték> | callgraph flow <kifejezés>... | callgraph skills get [--full] | callgraph autoload <Osztály>... [--project <alias|mappa>] [--json] | callgraph refs <rN> <k> [--project <alias|mappa>] | callgraph mcp [--auto-update] | callgraph --version  (bármely parancsnál: --no-gitignore = a .gitignore fájlok nélkül)"
     )
 }
 
@@ -267,6 +267,10 @@ pub enum CliArgs {
         project: Option<String>,
         json: bool,
     },
+    /// `skills get [core] [--full]`: встроенный скилл (версия совпадает с бинарником).
+    Skills {
+        full: bool,
+    },
     /// `refs`: раскрывает сноску типа из предыдущего ответа (`refs rN k`).
     Refs {
         id: String,
@@ -304,6 +308,17 @@ impl CliArgs {
         }
         if args.len() == 1 && matches!(args[0].as_str(), "--help" | "-h" | "help") {
             return Ok(Self::Help);
+        }
+        // Современный surface для агента: map / read / find / flow / skills; старые команды остаются.
+        match args.first().map(String::as_str) {
+            Some("map") => return Self::parse_locate(&args[1..]),
+            Some("read") => return Self::parse_read(&args[1..]),
+            Some("find") => return Self::parse_find(&args[1..]),
+            Some("skills") => return Self::parse_skills(&args[1..]),
+            Some("flow") if args.get(1).map(String::as_str) != Some("map") => {
+                return Self::parse_trace(&args[1..]);
+            }
+            _ => {}
         }
         if args.first().is_some_and(|a| a == "mcp") {
             let auto_update = args
@@ -400,6 +415,168 @@ impl CliArgs {
             });
         }
         Self::parse_analyze(args)
+    }
+
+    /// `read <path[::method]> [--body|--api|--flow|--lines N-M]`: умное чтение.
+    /// Файл → outline, `file::method` → тело; у тела сноски `--refs` включены по умолчанию.
+    fn parse_read(args: &[String]) -> Result<Self> {
+        let usage = || CallgraphError::Usage(Self::read_usage().into());
+        if args.iter().all(|arg| arg.starts_with('-')) {
+            return Err(usage());
+        }
+        let mut out: Vec<String> = Vec::new();
+        let mut body = false;
+        let mut plain = false;
+        for arg in args {
+            match arg.as_str() {
+                "--api" => {
+                    out.extend(["--format".to_owned(), "api".to_owned()]);
+                    plain = true;
+                }
+                "--flow" => {
+                    out.extend(["--format".to_owned(), "flow".to_owned()]);
+                    plain = true;
+                }
+                "--lines" => {
+                    out.push("--lines".to_owned());
+                    plain = true;
+                }
+                x if x.starts_with("--lines=") => {
+                    out.push(x.to_owned());
+                    plain = true;
+                }
+                "--body" => {
+                    body = true;
+                    out.push("--body".to_owned());
+                }
+                "--doc" => {
+                    body = true;
+                    out.push("--doc".to_owned());
+                }
+                "--raw" => {
+                    body = true;
+                    out.push("--raw".to_owned());
+                }
+                x => out.push(x.to_owned()),
+            }
+        }
+        if !plain {
+            let method = args
+                .iter()
+                .any(|arg| !arg.starts_with('-') && arg.contains("::"));
+            if body || method {
+                if !body {
+                    out.push("--body".to_owned());
+                }
+                if !out.iter().any(|arg| arg == "--refs") {
+                    out.push("--refs".to_owned());
+                }
+            }
+        }
+        Self::parse_show(&out)
+    }
+
+    /// `find <def|callers|string|const> <value>`: поиск по карте проекта.
+    fn parse_find(args: &[String]) -> Result<Self> {
+        let Some(action) = args.first().map(String::as_str) else {
+            return Err(CallgraphError::Usage(Self::find_usage().into()));
+        };
+        let rest = &args[1..];
+        match action {
+            "def" => {
+                let mut out = vec!["--all".to_owned()];
+                out.extend(rest.iter().cloned());
+                Self::parse_locate(&out)
+            }
+            "callers" => {
+                let mut out = vec![".".to_owned()];
+                out.extend_from_slice(&Self::with_flag(rest, "--grep")?);
+                Self::parse_show(&out)
+            }
+            "string" => {
+                let mut out = vec![".".to_owned()];
+                out.extend_from_slice(&Self::with_flag(rest, "--strings")?);
+                Self::parse_show(&out)
+            }
+            "const" => {
+                let mut out = vec![".".to_owned()];
+                out.extend_from_slice(&Self::with_flag(rest, "--const")?);
+                Self::parse_show(&out)
+            }
+            _ => Err(CallgraphError::Usage(Self::find_usage().into())),
+        }
+    }
+
+    /// Значение первого позиционного аргумента → `[flag, value, …флаги]`.
+    fn with_flag(args: &[String], flag: &str) -> Result<Vec<String>> {
+        let mut value = None;
+        let mut pass = Vec::new();
+        let mut i = 0;
+        while i < args.len() {
+            let arg = &args[i];
+            if arg == "--project" || arg == "--depth" {
+                pass.push(arg.clone());
+                if i + 1 < args.len() {
+                    pass.push(args[i + 1].clone());
+                    i += 2;
+                    continue;
+                }
+            } else if !arg.starts_with('-') {
+                if value.is_none() {
+                    value = Some(arg.clone());
+                    i += 1;
+                    continue;
+                }
+            } else {
+                pass.push(arg.clone());
+            }
+            i += 1;
+        }
+        let value = value.ok_or_else(|| CallgraphError::Usage(Self::find_usage().into()))?;
+        let mut out = vec![flag.to_owned(), value];
+        out.extend(pass);
+        Ok(out)
+    }
+
+    /// `skills get [core] [--full]`: встроенный скилл.
+    fn parse_skills(args: &[String]) -> Result<Self> {
+        let mut full = false;
+        let mut action = None;
+        for arg in args {
+            match arg.as_str() {
+                "--full" => full = true,
+                x if x.starts_with('-') => {
+                    return Err(CallgraphError::Usage(Self::skills_usage().into()));
+                }
+                x if action.is_none() => action = Some(x.to_owned()),
+                _ => {}
+            }
+        }
+        if action.as_deref().is_some_and(|action| action != "get") {
+            return Err(CallgraphError::Usage(Self::skills_usage().into()));
+        }
+        Ok(Self::Skills { full })
+    }
+
+    fn read_usage() -> &'static str {
+        crate::t!(
+            "callgraph read <path[::method]> [--body|--api|--flow|--lines N-M] [--project <alias|dir>]  (file: outline, file::method: body with type footnotes)",
+            "callgraph read <út[::metódus]> [--body|--api|--flow|--lines N-M] [--project <alias|mappa>]  (fájl: outline, fájl::metódus: törzs típus-lábjegyzetekkel)"
+        )
+    }
+
+    fn find_usage() -> &'static str {
+        crate::t!(
+            "callgraph find <def|callers|string|const> <value> [--depth N] [--project <alias|dir>]",
+            "callgraph find <def|callers|string|const> <érték> [--depth N] [--project <alias|mappa>]"
+        )
+    }
+
+    fn skills_usage() -> &'static str {
+        crate::t!(
+            "callgraph skills get [core] [--full]  (the built-in, version-matched skill)",
+            "callgraph skills get [core] [--full]  (a beépített, verzióhoz illő skill)"
+        )
     }
 
     fn parse_show(args: &[String]) -> Result<Self> {
@@ -1153,6 +1330,64 @@ mod tests {
             mode(&["show", "--raw", "--doc", "a.php::m"]),
             (true, BodyMode::Raw)
         );
+    }
+
+    #[test]
+    fn modern_surface_routes_to_existing_commands() {
+        let show = |a: &[&str]| match parse(a).unwrap() {
+            CliArgs::Show {
+                body,
+                refs,
+                format,
+                grep,
+                strings,
+                paths,
+                ..
+            } => (body, refs, format, grep, strings, paths),
+            other => panic!("{other:?}"),
+        };
+        // файл → outline, без сносок
+        assert_eq!(
+            show(&["read", "a.php"]),
+            (
+                false,
+                false,
+                "outline".to_owned(),
+                None,
+                None,
+                vec![PathBuf::from("a.php")]
+            )
+        );
+        // file::method → тело и сноски по умолчанию
+        assert_eq!(
+            show(&["read", "a.php::m"]),
+            (
+                true,
+                true,
+                "outline".to_owned(),
+                None,
+                None,
+                vec![PathBuf::from("a.php::m")]
+            )
+        );
+        // --api отключает тело и сноски
+        let (body, refs, format, ..) = show(&["read", "--api", "a.php::m"]);
+        assert!(!body && !refs && format == "api");
+        // find
+        let (_, _, _, grep, _, paths) =
+            show(&["find", "callers", "--project", "p", "m", "--depth", "2"]);
+        assert_eq!(grep.as_deref(), Some("m"));
+        assert_eq!(paths, vec![PathBuf::from(".")]);
+        assert_eq!(show(&["find", "string", "text"]).4.as_deref(), Some("text"));
+        // map / flow
+        assert!(matches!(
+            parse(&["map", "HotelOnlineService"]).unwrap(),
+            CliArgs::Locate { terms, .. } if terms == ["HotelOnlineService"]
+        ));
+        assert!(matches!(
+            parse(&["flow", "hotel_name"]).unwrap(),
+            CliArgs::Trace { terms, .. } if terms == ["hotel_name"]
+        ));
     }
 
     #[test]
