@@ -61,6 +61,7 @@ pub fn build_command(args: CliArgs) -> Result<Box<dyn Command>> {
             const_filter,
             body,
             body_mode,
+            refs,
             grep,
             category,
             depth,
@@ -79,6 +80,7 @@ pub fn build_command(args: CliArgs) -> Result<Box<dyn Command>> {
             const_filter,
             body,
             body_mode,
+            refs,
             grep,
             category,
             depth,
@@ -109,6 +111,12 @@ pub fn build_command(args: CliArgs) -> Result<Box<dyn Command>> {
             classes,
             project,
             json,
+            crate::skill::SkillHome::from_env(),
+        ))),
+        CliArgs::Refs { id, key, project } => Ok(Box::new(commands::RefsCommand::new(
+            id,
+            key,
+            project,
             crate::skill::SkillHome::from_env(),
         ))),
         CliArgs::Trace {

@@ -18,6 +18,7 @@ pub struct ShowCommand {
     const_filter: Option<String>,
     body: bool,
     body_mode: BodyMode,
+    refs: bool,
     grep: Option<String>,
     category: Option<Vec<String>>,
     depth: usize,
@@ -41,6 +42,7 @@ impl ShowCommand {
         const_filter: Option<String>,
         body: bool,
         body_mode: BodyMode,
+        refs: bool,
         grep: Option<String>,
         category: Option<Vec<String>>,
         depth: usize,
@@ -60,6 +62,7 @@ impl ShowCommand {
             const_filter,
             body,
             body_mode,
+            refs,
             grep,
             category,
             depth,
@@ -73,6 +76,18 @@ impl Command for ShowCommand {
     fn run(&self, out: &mut dyn Write, _err: &mut dyn Write) -> Result<i32> {
         if let Some(pattern) = self.notes.as_deref() {
             return self.search_notes(pattern, out, _err);
+        }
+        if self.refs && !self.body {
+            return Self::report(
+                _err,
+                crate::error::CallgraphError::Usage(
+                    crate::t!(
+                        "--refs works only together with --body.",
+                        "A --refs csak --body-val együtt értelmezett."
+                    )
+                    .into(),
+                ),
+            );
         }
         let selectors = match SelectorSet::parse(&self.paths) {
             Ok(value) => value,
@@ -117,6 +132,9 @@ impl Command for ShowCommand {
         // találat nélkül a `--grep` szokásos „nincs találat” kimenete marad
         if self.grep.is_some() && self.body && self.depth <= 1 && !rows.is_empty() {
             let mut text = FormatterRegistry::format_body(&rows, self.body_mode);
+            if self.refs {
+                text = crate::refs::annotate_body(&text, &rows, engine.root());
+            }
             let trailer = parse_trailer(&engine, &rows, &text, true);
             text.push_str(&trailer);
             write!(out, "{}", engine.relativize(&text))?;
@@ -173,10 +191,13 @@ impl Command for ShowCommand {
             // nélkül a kimenet változatlan
             crate::packages::annotate_frameworks(&mut rows, engine.root(), &self.format);
         }
-        let text = match self.render(&rows) {
+        let mut text = match self.render(&rows) {
             Ok(value) => value,
             Err(error) => return Self::report(_err, error),
         };
+        if self.refs && self.body {
+            text = crate::refs::annotate_body(&text, &rows, engine.root());
+        }
         // `--layers`: a summary rétegenként, az outline `FILE` soraiban a szerep
         let text = match engine.layer_scope().filter(|_| self.layers.layers) {
             Some(scope) if self.format == "summary" => {

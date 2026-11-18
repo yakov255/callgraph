@@ -17,8 +17,8 @@ use super::uses_args::{parse_deps, parse_uses};
 
 fn usage() -> &'static str {
     crate::t!(
-        "callgraph [--lang <id,...>] [--cache <file>] [--no-cache] <file|dir> [...] | callgraph prune [--cache <file>] [--dry-run] | callgraph set-lang [en|hu] | callgraph self-update [--check] | callgraph note add|list|rm … | callgraph refresh [--project <alias|dir>] [--background] [<path>…] | callgraph locate <term>... [--all] [--project <alias|dir>] | callgraph hook install|uninstall|status | callgraph stats [--events] [--days N] | callgraph flow map [--project <alias|dir>] [--json] [--table <name>] [--full] | callgraph trace <term>... [--project <alias|dir>] [--json] [--full] [--must] | callgraph autoload <Class>... [--project <alias|dir>] [--json] | callgraph mcp [--auto-update] | callgraph --version  (any command: --no-gitignore = ignore the .gitignore files)",
-        "callgraph [--lang <id,...>] [--cache <fájl>] [--no-cache] <fájl|mappa> [...] | callgraph prune [--cache <fájl>] [--dry-run] | callgraph set-lang [en|hu] | callgraph self-update [--check] | callgraph note add|list|rm … | callgraph refresh [--project <alias|mappa>] [--background] [<út>…] | callgraph locate <kifejezés>... [--all] [--project <alias|mappa>] | callgraph hook install|uninstall|status | callgraph stats [--events] [--days N] | callgraph flow map [--project <alias|mappa>] [--json] [--table <név>] [--full] | callgraph trace <kifejezés>... [--project <alias|mappa>] [--json] [--full] [--must] | callgraph autoload <Osztály>... [--project <alias|mappa>] [--json] | callgraph mcp [--auto-update] | callgraph --version  (bármely parancsnál: --no-gitignore = a .gitignore fájlok nélkül)"
+        "callgraph [--lang <id,...>] [--cache <file>] [--no-cache] <file|dir> [...] | callgraph prune [--cache <file>] [--dry-run] | callgraph set-lang [en|hu] | callgraph self-update [--check] | callgraph note add|list|rm … | callgraph refresh [--project <alias|dir>] [--background] [<path>…] | callgraph locate <term>... [--all] [--project <alias|dir>] | callgraph hook install|uninstall|status | callgraph stats [--events] [--days N] | callgraph flow map [--project <alias|dir>] [--json] [--table <name>] [--full] | callgraph trace <term>... [--project <alias|dir>] [--json] [--full] [--must] | callgraph autoload <Class>... [--project <alias|dir>] [--json] | callgraph refs <rN> <k> [--project <alias|dir>] | callgraph mcp [--auto-update] | callgraph --version  (any command: --no-gitignore = ignore the .gitignore files)",
+        "callgraph [--lang <id,...>] [--cache <fájl>] [--no-cache] <fájl|mappa> [...] | callgraph prune [--cache <fájl>] [--dry-run] | callgraph set-lang [en|hu] | callgraph self-update [--check] | callgraph note add|list|rm … | callgraph refresh [--project <alias|mappa>] [--background] [<út>…] | callgraph locate <kifejezés>... [--all] [--project <alias|mappa>] | callgraph hook install|uninstall|status | callgraph stats [--events] [--days N] | callgraph flow map [--project <alias|mappa>] [--json] [--table <név>] [--full] | callgraph trace <kifejezés>... [--project <alias|mappa>] [--json] [--full] [--must] | callgraph autoload <Osztály>... [--project <alias|mappa>] [--json] | callgraph refs <rN> <k> [--project <alias|mappa>] | callgraph mcp [--auto-update] | callgraph --version  (bármely parancsnál: --no-gitignore = a .gitignore fájlok nélkül)"
     )
 }
 
@@ -38,8 +38,8 @@ fn callers_usage() -> &'static str {
 
 fn show_usage() -> &'static str {
     crate::t!(
-        "callgraph show [--project <root>] [--label <name>] [--format <f>] [--body [--doc|--raw]|--lines <n>-<m>|--strings <pattern>|--const <pattern>] [--grep <pattern>] [--category <cat,...>] [--depth N] [--guess] [--notes <pattern>] [--layer <name,...>] [--layers] [--by-layer] [--full] <path[::m]>...",
-        "callgraph show [--project <gyökér>] [--label <név>] [--format <f>] [--body [--doc|--raw]|--lines <n>-<m>|--strings <minta>|--const <minta>] [--grep <minta>] [--category <kat,...>] [--depth N] [--guess] [--notes <minta>] [--layer <név,...>] [--layers] [--by-layer] [--full] <út[::m]>..."
+        "callgraph show [--project <root>] [--label <name>] [--format <f>] [--body [--doc|--raw] [--refs]|--lines <n>-<m>|--strings <pattern>|--const <pattern>] [--grep <pattern>] [--category <cat,...>] [--depth N] [--guess] [--notes <pattern>] [--layer <name,...>] [--layers] [--by-layer] [--full] <path[::m]>...",
+        "callgraph show [--project <gyökér>] [--label <név>] [--format <f>] [--body [--doc|--raw] [--refs]|--lines <n>-<m>|--strings <minta>|--const <minta>] [--grep <minta>] [--category <kat,...>] [--depth N] [--guess] [--notes <minta>] [--layer <név,...>] [--layers] [--by-layer] [--full] <út[::m]>..."
     )
 }
 
@@ -168,6 +168,8 @@ pub enum CliArgs {
         body: bool,
         /// A `--body` nézete: tömör (alap), `--doc` (docblockkal) vagy `--raw` (szűretlen); mindkettő `--body`-t is jelent.
         body_mode: BodyMode,
+        /// `--refs`: маркеры типов и сноски в `--body`.
+        refs: bool,
         grep: Option<String>,
         category: Option<Vec<String>>,
         depth: usize,
@@ -265,6 +267,12 @@ pub enum CliArgs {
         project: Option<String>,
         json: bool,
     },
+    /// `refs`: раскрывает сноску типа из предыдущего ответа (`refs rN k`).
+    Refs {
+        id: String,
+        key: usize,
+        project: Option<String>,
+    },
     /// `trace`: цепочки потока данных от источника до чтения.
     Trace {
         terms: Vec<String>,
@@ -345,6 +353,9 @@ impl CliArgs {
         if args.first().is_some_and(|a| a == "autoload") {
             return Self::parse_autoload(&args[1..]);
         }
+        if args.first().is_some_and(|a| a == "refs") {
+            return Self::parse_refs(&args[1..]);
+        }
         if args.first().is_some_and(|a| a == "hook") {
             return Self::parse_hook(&args[1..]);
         }
@@ -403,6 +414,7 @@ impl CliArgs {
         let mut const_filter = None;
         let mut body = false;
         let mut body_mode = BodyMode::Compact;
+        let mut refs = false;
         let mut grep = None;
         let mut category = None;
         let mut depth = 1;
@@ -438,6 +450,10 @@ impl CliArgs {
                 "--raw" => {
                     body = true;
                     body_mode = BodyMode::Raw;
+                    i += 1;
+                }
+                "--refs" => {
+                    refs = true;
                     i += 1;
                 }
                 "--guess" => {
@@ -554,6 +570,7 @@ impl CliArgs {
             const_filter,
             body,
             body_mode,
+            refs,
             grep,
             category,
             depth,
@@ -725,6 +742,47 @@ impl CliArgs {
             project,
             json,
         })
+    }
+
+    fn refs_usage() -> &'static str {
+        crate::t!(
+            "callgraph refs <rN> <k> [--project <alias|dir>]  (expand footnote #k of result rN)",
+            "callgraph refs <rN> <k> [--project <alias|mappa>]  (az rN eredmény #k lábjegyzetének kifejtése)"
+        )
+    }
+
+    fn parse_refs(args: &[String]) -> Result<Self> {
+        let usage = || CallgraphError::Usage(Self::refs_usage().into());
+        let mut id = None;
+        let mut key = None;
+        let mut project = None;
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--project" if i + 1 < args.len() => {
+                    project = Some(args[i + 1].clone());
+                    i += 2;
+                }
+                x if x.starts_with("--project=") => {
+                    project = Some(x[10..].to_owned());
+                    i += 1;
+                }
+                x if x.starts_with('-') && x.len() > 1 => return Err(usage()),
+                x if id.is_none() => {
+                    id = Some(x.to_owned());
+                    i += 1;
+                }
+                x if key.is_none() => {
+                    key = x.trim_start_matches('#').parse().ok();
+                    i += 1;
+                }
+                _ => return Err(usage()),
+            }
+        }
+        match (id, key) {
+            (Some(id), Some(key)) => Ok(Self::Refs { id, key, project }),
+            _ => Err(usage()),
+        }
     }
 
     fn parse_trace(args: &[String]) -> Result<Self> {
