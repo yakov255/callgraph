@@ -1,6 +1,7 @@
 //! A CLI-alparancsok (egy fájl = egy parancs).
 
 mod analyze;
+mod autoload;
 mod callers;
 mod deps;
 mod error;
@@ -36,6 +37,7 @@ use crate::error::{CallgraphError, Result};
 use crate::skill::{ProjectRegistry, SkillHome};
 
 pub use analyze::AnalyzeCommand;
+pub use autoload::AutoloadCommand;
 pub use callers::CallersCommand;
 pub use deps::DepsCommand;
 pub use error::ErrorCommand;

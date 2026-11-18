@@ -2,6 +2,7 @@
 //! Az architektúra: `ARCHITECTURE.md`.
 
 pub mod analysis;
+pub mod autoload;
 pub mod cli;
 pub mod core;
 pub mod error;

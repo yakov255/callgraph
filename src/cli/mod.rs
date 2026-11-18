@@ -101,6 +101,16 @@ pub fn build_command(args: CliArgs) -> Result<Box<dyn Command>> {
             background,
             crate::skill::SkillHome::from_env(),
         ))),
+        CliArgs::Autoload {
+            classes,
+            project,
+            json,
+        } => Ok(Box::new(commands::AutoloadCommand::new(
+            classes,
+            project,
+            json,
+            crate::skill::SkillHome::from_env(),
+        ))),
         CliArgs::Trace {
             terms,
             project,
