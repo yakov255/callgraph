@@ -9,12 +9,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions: [Sem
 
 - **Type footnotes in `--body` (`--refs`)** and the `refs <rN> <k>` command: a method body gets `[#k]` markers after
   named types in its signature; the footnote block names the class and its file, and `refs` shows the class source with
-  its own markers — chains such as `?ErrorLogEntity` → its constructor's `?Throwable` open step by step. Built-in PHP
-  types are marked `[internal]`, unresolved ones `not found`.
+  its own markers — chains such as `?ErrorLogEntity` → its constructor's `?Throwable` open step by step. Docblock
+  tags (`@param`, `@return`, `@throws`, `@var`, `@property`) and property types are marked too. Built-in PHP types are
+  marked `[internal]`, unresolved ones `not found`.
 - **Zero-config composer autoload** (`callgraph autoload <Class>...`): every `composer.json` of the project is read
   (own psr-4 / psr-0, `autoload-dev`, `config.vendor-dir`), vendor packages come from `vendor/composer/installed.json`
   (or their manifests), and `vendor/composer/autoload_classmap.php` covers classmap projects. The longest prefix wins;
-  at a tie the composer root nearest to the referencing file wins, then own code before vendor.
+  at a tie the composer root nearest to the referencing file wins, then own code before vendor. The map is cached in
+  `.callgraph/autoload.json` and invalidated by `composer.json` / `installed.json` / classmap stamps.
 
 ## [1.0.2] — 2026-11-16
 

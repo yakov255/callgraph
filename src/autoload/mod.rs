@@ -17,6 +17,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Каталоги, в которых не ищем `composer.json`.
@@ -35,7 +36,7 @@ const MAX_COMPOSERS: usize = 4096;
 const MAX_DEPTH: usize = 16;
 
 /// Какое правило автозагрузки разрешило имя.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AutoloadKind {
     /// `autoload.psr-4` (или psr-4 vendor-пакета).
     Psr4,
@@ -57,7 +58,7 @@ impl AutoloadKind {
 }
 
 /// Источник правила: свой код проекта или vendor-пакет.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClassSource {
     /// Собственный namespace из `autoload` / `autoload-dev`.
     Own,
@@ -66,14 +67,14 @@ pub enum ClassSource {
 }
 
 /// Корень `composer.json` и соответствующий ему каталог vendor.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Root {
     dir: PathBuf,
     vendor: PathBuf,
 }
 
 /// Правило psr-4 / psr-0.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Rule {
     prefix: String,
     dirs: Vec<PathBuf>,
@@ -99,7 +100,7 @@ pub struct ResolvedClass {
 }
 
 /// Все правила composer-автозагрузки проекта.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct AutoloadMap {
     roots: Vec<Root>,
     rules: Vec<Rule>,
@@ -109,10 +110,16 @@ pub struct AutoloadMap {
 impl AutoloadMap {
     /// Читает все `composer.json` проекта (и autoload соответствующих vendor).
     pub fn discover(project: &Path) -> Self {
-        let mut map = Self::default();
-        for composer in composer_files(project) {
-            map.add_composer(&composer, project);
+        let composers = composer_files(project);
+        let stamps = stamps(&composers);
+        if let Some(map) = load_cache(project, &stamps) {
+            return map;
         }
+        let mut map = Self::default();
+        for composer in &composers {
+            map.add_composer(composer, project);
+        }
+        save_cache(project, stamps, &map);
         map
     }
 
@@ -519,6 +526,116 @@ fn composer_files(root: &Path) -> Vec<PathBuf> {
         queue.extend(children.into_iter().map(|child| (child, depth + 1)));
     }
     out
+}
+
+/// Версия формата кеша: меняется вместе с логикой разбора.
+const CACHE_VERSION: u32 = 1;
+
+/// Кеш карты: отпечатки `composer.json` и файлов vendor + сама карта.
+#[derive(Debug, Serialize, Deserialize)]
+struct Cache {
+    version: u32,
+    composers: Vec<Stamp>,
+    vendor: Vec<Stamp>,
+    map: AutoloadMap,
+}
+
+/// Отпечаток файла: путь, mtime в наносекундах и размер.
+#[derive(Debug, Serialize, Deserialize)]
+struct Stamp {
+    path: PathBuf,
+    mtime: u128,
+    size: u64,
+}
+
+fn stamps(paths: &[PathBuf]) -> Vec<Stamp> {
+    paths.iter().filter_map(|path| stamp(path)).collect()
+}
+
+fn stamp(path: &Path) -> Option<Stamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    Some(Stamp {
+        path: path.to_path_buf(),
+        mtime,
+        size: meta.len(),
+    })
+}
+
+/// Файлы vendor, от которых зависит карта (перегенерируются composer-ом).
+fn vendor_files(map: &AutoloadMap) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for root in &map.roots {
+        out.push(root.vendor.join("composer").join("installed.json"));
+        out.push(root.vendor.join("composer").join("autoload_classmap.php"));
+    }
+    out
+}
+
+fn cache_path(project: &Path) -> PathBuf {
+    project
+        .join(crate::project::STORE_DIR)
+        .join("autoload.json")
+}
+
+fn load_cache(project: &Path, composers: &[Stamp]) -> Option<AutoloadMap> {
+    let text = std::fs::read_to_string(cache_path(project)).ok()?;
+    let cache: Cache = serde_json::from_str(&text).ok()?;
+    if cache.version != CACHE_VERSION || cache.composers.len() != composers.len() {
+        return None;
+    }
+    if !same_stamps(&cache.composers, composers) {
+        return None;
+    }
+    for cached in &cache.vendor {
+        let current = stamp(&cached.path)?;
+        if current.mtime != cached.mtime || current.size != cached.size {
+            return None;
+        }
+    }
+    Some(cache.map)
+}
+
+fn save_cache(project: &Path, composers: Vec<Stamp>, map: &AutoloadMap) {
+    let cache = Cache {
+        version: CACHE_VERSION,
+        composers,
+        vendor: stamps(&vendor_files(map)),
+        map: AutoloadMap {
+            roots: map.roots.clone(),
+            rules: map.rules.clone(),
+            classmap: map.classmap.clone(),
+        },
+    };
+    let Ok(text) = serde_json::to_string(&cache) else {
+        return;
+    };
+    if crate::project::ProjectStore::at_root(project)
+        .ensure()
+        .is_err()
+    {
+        return;
+    }
+    let path = cache_path(project);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, text).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
+fn same_stamps(a: &[Stamp], b: &[Stamp]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(a, b)| a.path == b.path && a.mtime == b.mtime && a.size == b.size)
 }
 
 #[cfg(test)]

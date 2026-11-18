@@ -70,12 +70,6 @@ impl Numbered {
     }
 }
 
-/// Вхождение типа в строке: текст типа и якорь (имя параметра / возвращаемое значение).
-enum Anchor {
-    Param(String),
-    Return,
-}
-
 /// Сноски для одного файла.
 struct Pass<'a> {
     map: &'a AutoloadMap,
@@ -85,35 +79,126 @@ struct Pass<'a> {
 }
 
 impl Pass<'_> {
-    /// Обрабатывает одну строку с номером: вставляет маркеры в сигнатуру метода.
+    /// Обрабатывает одну строку с номером: вставляет маркеры после именованных типов.
     fn line(&mut self, number: u32, text: &str) -> String {
-        let Some(occurrences) = occurrences(self.graph, number) else {
-            return text.to_owned();
-        };
+        let container = container_for_line(self.graph, number);
         let mut inserts: Vec<(usize, String)> = Vec::new();
-        for (type_text, anchor) in occurrences {
-            let at = match &anchor {
-                Anchor::Param(variable) => {
-                    let variable = format!("${variable}");
-                    let Some(var_at) = text.find(&variable) else {
-                        continue;
-                    };
-                    text[..var_at].rfind(type_text)
-                }
-                Anchor::Return => text.rfind(type_text),
-            };
-            let Some(start) = at else {
-                continue;
-            };
-            for (_, end, name) in types::named(type_text) {
-                let fqcn =
-                    resolve_name(&name, self.graph, occurrence_container(self.graph, number));
+        for (start, end) in type_spans(self.graph, number, text) {
+            let ty = &text[start..end];
+            for (_, offset, name) in types::named(ty) {
+                let fqcn = resolve_name(&name, self.graph, container);
                 let id = self.numbered.number(&fqcn, self.map, Path::new(self.file));
-                inserts.push((start + end, format!("[#{id}]")));
+                inserts.push((start + offset, format!("[#{id}]")));
             }
         }
         insert_markers(text, inserts)
     }
+}
+
+/// Позиции типов в отображаемой строке: сигнатура метода, docblock, свойство.
+fn type_spans(graph: &FileGraph, number: u32, text: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    if let Some(method) = graph.methods.iter().find(|method| method.line == number) {
+        for param in &method.params {
+            let Some((ty, variable)) = param_type(param) else {
+                continue;
+            };
+            let variable = format!("${variable}");
+            let Some(var_at) = text.find(&variable) else {
+                continue;
+            };
+            if let Some(start) = text[..var_at].rfind(ty) {
+                out.push((start, start + ty.len()));
+            }
+        }
+        if let Some(ret) = method
+            .return_type
+            .as_deref()
+            .filter(|ret| !ret.trim().is_empty())
+            && let Some(start) = text.rfind(ret)
+        {
+            out.push((start, start + ret.len()));
+        }
+    }
+    if let Some(span) = docblock_type_span(text) {
+        out.push(span);
+    }
+    if let Some(property) = graph
+        .properties
+        .iter()
+        .find(|property| property.line == number)
+        && let Some(ty) = property
+            .type_hint
+            .as_deref()
+            .filter(|ty| !ty.trim().is_empty())
+    {
+        let variable = format!("${}", property.name);
+        if let Some(var_at) = text.find(&variable)
+            && let Some(start) = text[..var_at].rfind(ty)
+        {
+            out.push((start, start + ty.len()));
+        }
+    }
+    out
+}
+
+/// Тип и имя переменной из параметра: `?Foo $x = null` → (`?Foo`, `x`).
+fn param_type(param: &str) -> Option<(&str, String)> {
+    let dollar = param.find('$')?;
+    let variable = param[dollar + 1..]
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect::<String>();
+    let raw = param[..dollar]
+        .trim_end()
+        .trim_end_matches("...")
+        .trim_end();
+    let ty = strip_modifiers(raw);
+    (!ty.is_empty()).then_some((ty, variable))
+}
+
+/// Тип из строки docblock: `@param Foo $x`, `@return list<Bar>`, `@throws Baz`.
+fn docblock_type_span(text: &str) -> Option<(usize, usize)> {
+    const TAGS: &[&str] = &[
+        "param",
+        "return",
+        "var",
+        "throws",
+        "property",
+        "property-read",
+        "property-write",
+        "method",
+    ];
+    let at = text.find('@')?;
+    let rest = &text[at..];
+    let tag = rest.split_whitespace().next()?;
+    let tag = tag
+        .trim_start_matches("@phpstan-")
+        .trim_start_matches("@psalm-")
+        .trim_start_matches('@');
+    if !TAGS.contains(&tag) {
+        return None;
+    }
+    let mut start = at + rest.split_whitespace().next()?.len();
+    while text[start..].starts_with(|c: char| c.is_whitespace()) {
+        start += text[start..].chars().next()?.len_utf8();
+    }
+    let end = type_token_end(text, start);
+    (end > start).then_some((start, end))
+}
+
+/// Конец типа: пробел на нулевой глубине (`<>`, `{}`, `()`, `[]` считаются вложенными).
+fn type_token_end(text: &str, start: usize) -> usize {
+    let mut depth = 0i32;
+    for (offset, c) in text[start..].char_indices() {
+        match c {
+            '{' | '<' | '(' | '[' => depth += 1,
+            '}' | '>' | ')' | ']' => depth -= 1,
+            c if c.is_whitespace() && depth <= 0 => return start + offset,
+            _ => {}
+        }
+    }
+    text.len()
 }
 
 /// Встроенные классы и интерфейсы PHP: исходника в проекте нет, но это не «неизвестный» тип.
@@ -125,8 +210,8 @@ fn is_internal(fqcn: &str) -> bool {
         "BackedEnum",
         "Closure",
         "Countable",
-        "DateTime",
         "DateInterval",
+        "DateTime",
         "DateTimeImmutable",
         "DateTimeInterface",
         "DateTimeZone",
@@ -165,37 +250,6 @@ fn insert_markers(text: &str, mut inserts: Vec<(usize, String)>) -> String {
     out
 }
 
-/// Типы сигнатуры метода на его строке: `(текст типа, якорь)`.
-fn occurrences(graph: &FileGraph, line: u32) -> Option<Vec<(&str, Anchor)>> {
-    let method = graph.methods.iter().find(|method| method.line == line)?;
-    let mut out = Vec::new();
-    for param in &method.params {
-        let Some(dollar) = param.find('$') else {
-            continue;
-        };
-        let variable = param[dollar + 1..]
-            .chars()
-            .take_while(|c| c.is_alphanumeric() || *c == '_')
-            .collect::<String>();
-        let raw = param[..dollar]
-            .trim_end()
-            .trim_end_matches("...")
-            .trim_end();
-        let ty = strip_modifiers(raw);
-        if !ty.is_empty() {
-            out.push((ty, Anchor::Param(variable)));
-        }
-    }
-    if let Some(ret) = method
-        .return_type
-        .as_deref()
-        .filter(|ret| !ret.trim().is_empty())
-    {
-        out.push((ret, Anchor::Return));
-    }
-    (!out.is_empty()).then_some(out)
-}
-
 /// Убирает модификаторы promoted-параметра (`private readonly Foo $x`).
 fn strip_modifiers(text: &str) -> &str {
     let mut rest = text;
@@ -215,11 +269,25 @@ fn strip_modifiers(text: &str) -> &str {
     }
 }
 
-/// Контейнер метода (для `self` / `parent`).
-fn occurrence_container(graph: &FileGraph, line: u32) -> Option<&crate::model::Container> {
-    let method = graph.methods.iter().find(|method| method.line == line)?;
-    let name = method.container.as_deref()?;
-    graph.containers.iter().find(|c| c.name == name)
+/// Контейнер для строки: метод на этой строке или ближайший ниже (docblock перед методом).
+fn container_for_line(graph: &FileGraph, line: u32) -> Option<&crate::model::Container> {
+    let name = graph
+        .methods
+        .iter()
+        .filter(|method| method.line >= line)
+        .min_by_key(|method| method.line)
+        .and_then(|method| method.container.as_deref())
+        .or_else(|| {
+            graph
+                .properties
+                .iter()
+                .find(|property| property.line == line)
+                .and_then(|property| property.container.as_deref())
+        })?;
+    graph
+        .containers
+        .iter()
+        .find(|container| container.name == name)
 }
 
 /// Полное имя типа по imports и namespace файла.

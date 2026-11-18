@@ -11,12 +11,14 @@ Angol változat: [CHANGELOG.md](CHANGELOG.md) — a kettő tartalma azonos.
 - **Típus-lábjegyzetek a `--body` kimenetben (`--refs`)** és a `refs <rN> <k>` parancs: a metódus törzse a szignatúra
   nevesített típusai után `[#k]` jelölőt kap; a lábjegyzet-blokk megadja az osztályt és a fájlját, a `refs` pedig a
   class forrását mutatja a saját jelölőivel — a `?ErrorLogEntity` → konstruktor `?Throwable` lánc lépésenként nyílik.
+  A docblock-tagek (`@param`, `@return`, `@throws`, `@var`, `@property`) és a property-típusok is jelölődnek.
   A beépített PHP-típusok `[internal]`, a fel nem oldottak `not found` jelölést kapnak.
 - **Nulla konfigurációjú composer-autoload** (`callgraph autoload <Osztály>...`): a projekt minden `composer.json`-ját
   beolvassa (saját psr-4 / psr-0, `autoload-dev`, `config.vendor-dir`), a vendor csomagok a
   `vendor/composer/installed.json`-ból (vagy manifestjükből) jönnek, a classmap-es projekteket a
   `vendor/composer/autoload_classmap.php` fedi. A leghosszabb előtag nyer; holtversenynél a hivatkozó fájlhoz
-  legközelebbi composer-gyökér, majd a saját kód a vendor előtt.
+  legközelebbi composer-gyökér, majd a saját kód a vendor előtt. A térkép a `.callgraph/autoload.json`-ban cache-elődik,
+  és a `composer.json` / `installed.json` / classmap bélyegei érvénytelenítik.
 
 ## [1.0.2] — 2026-11-16
 
