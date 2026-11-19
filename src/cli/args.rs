@@ -267,6 +267,22 @@ pub enum CliArgs {
         project: Option<String>,
         json: bool,
     },
+    /// `find text <pattern>`: текстовый поиск по не-AST файлам (neon, yaml, feature, env).
+    FindText {
+        pattern: String,
+        globs: Option<Vec<String>>,
+        files: bool,
+        json: bool,
+        project: Option<String>,
+    },
+    /// `find refs <Symbol>`: все упоминания символа (use, new, типы, docblock, …).
+    FindRefs {
+        symbol: String,
+        kinds: Option<Vec<String>>,
+        files: bool,
+        json: bool,
+        project: Option<String>,
+    },
     /// `skills get [core] [--full]`: встроенный скилл (версия совпадает с бинарником).
     Skills {
         full: bool,
@@ -503,8 +519,93 @@ impl CliArgs {
                 out.extend_from_slice(&Self::with_flag(rest, "--const")?);
                 Self::parse_show(&out)
             }
+            "refs" => Self::parse_find_refs(rest),
+            "text" => Self::parse_find_text(rest),
             _ => Err(CallgraphError::Usage(Self::find_usage().into())),
         }
+    }
+
+    /// `find text <pattern> [--glob '*.neon,*.yaml'] [--files] [--json] [--project X]`.
+    fn parse_find_text(args: &[String]) -> Result<Self> {
+        let mut pattern = None;
+        let mut globs = None;
+        let mut files = false;
+        let mut json = false;
+        let mut project = None;
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--files" => files = true,
+                "--json" => json = true,
+                "--glob" if i + 1 < args.len() => {
+                    globs = Some(args[i + 1].split(',').map(str::to_owned).collect());
+                    i += 1;
+                }
+                x if x.starts_with("--glob=") => {
+                    globs = Some(x[7..].split(',').map(str::to_owned).collect());
+                }
+                "--project" if i + 1 < args.len() => {
+                    project = Some(args[i + 1].clone());
+                    i += 1;
+                }
+                x if x.starts_with("--project=") => project = Some(x[10..].to_owned()),
+                x if x.starts_with('-') && x.len() > 1 => {
+                    return Err(crate::cli::commands::find_text::usage_error());
+                }
+                x if pattern.is_none() => pattern = Some(x.to_owned()),
+                _ => return Err(crate::cli::commands::find_text::usage_error()),
+            }
+            i += 1;
+        }
+        let pattern = pattern.ok_or_else(crate::cli::commands::find_text::usage_error)?;
+        Ok(Self::FindText {
+            pattern,
+            globs,
+            files,
+            json,
+            project,
+        })
+    }
+
+    /// `find refs <Symbol> [--kind use,new,…] [--files] [--json] [--project X]`.
+    fn parse_find_refs(args: &[String]) -> Result<Self> {
+        let usage = || CallgraphError::Usage(Self::find_usage().into());
+        let mut symbol = None;
+        let mut kinds = None;
+        let mut files = false;
+        let mut json = false;
+        let mut project = None;
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--files" => files = true,
+                "--json" => json = true,
+                "--kind" if i + 1 < args.len() => {
+                    kinds = Some(args[i + 1].split(',').map(str::to_owned).collect());
+                    i += 1;
+                }
+                x if x.starts_with("--kind=") => {
+                    kinds = Some(x[7..].split(',').map(str::to_owned).collect());
+                }
+                "--project" if i + 1 < args.len() => {
+                    project = Some(args[i + 1].clone());
+                    i += 1;
+                }
+                x if x.starts_with("--project=") => project = Some(x[10..].to_owned()),
+                x if x.starts_with('-') && x.len() > 1 => return Err(usage()),
+                x if symbol.is_none() => symbol = Some(x.to_owned()),
+                _ => return Err(usage()),
+            }
+            i += 1;
+        }
+        let symbol = symbol.ok_or_else(usage)?;
+        Ok(Self::FindRefs {
+            symbol,
+            kinds,
+            files,
+            json,
+            project,
+        })
     }
 
     /// Значение первого позиционного аргумента → `[flag, value, …флаги]`.
@@ -567,8 +668,8 @@ impl CliArgs {
 
     fn find_usage() -> &'static str {
         crate::t!(
-            "callgraph find <def|callers|string|const> <value> [--depth N] [--project <alias|dir>]",
-            "callgraph find <def|callers|string|const> <érték> [--depth N] [--project <alias|mappa>]"
+            "callgraph find <def|callers|string|const|refs|text> <value> [--depth N] [--kind …] [--files] [--project <alias|dir>]",
+            "callgraph find <def|callers|string|const|refs|text> <érték> [--depth N] [--kind …] [--files] [--project <alias|mappa>]"
         )
     }
 

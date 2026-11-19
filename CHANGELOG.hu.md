@@ -8,6 +8,13 @@ Angol változat: [CHANGELOG.md](CHANGELOG.md) — a kettő tartalma azonos.
 
 ### Új
 
+- **`find refs <Symbol>`:** a szimbólum minden említése, nem csak a hívási célok: `use`, `new`, `instanceof`,
+  `catch`, `implements`/`extends`, `X::class`, `X::CONST`, property/paraméter/visszatérési típus, docblock és
+  megjegyzés. `--kind use,new,…` szűrő, `--files` (soronként egy út, közvetlenül a `read`-hez), `--json`.
+- **`find text <pattern>`:** részsztring-keresés az AST-gráfon kívüli fájlokban (`.neon`, `.yaml`, `.xml`,
+  `.feature`, `.env`, `.dist`); `--glob '*.neon,*.yaml'` szűrő (kapcsos zárójel és `**` is), `--files`, `--json`.
+- **`X::class` a `--const`-ban:** az osztálykonstansok most a `::class` hivatkozásokat is hozzák (DI-tömbök,
+  `Definition(Foo::class)`).
 - **Agent-felület:** `map` (a `locate` álneve), `read <fájl[::metódus]>` (fájl → outline, metódus → törzs
   típus-lábjegyzetekkel alapból; `--body`, `--api`, `--flow`, `--lines`), `find def|callers|string|const`,
   `flow` (alapból trace, a `flow map` változatlan) és `skills get [--full]` (a beépített, verzióhoz illő skill).

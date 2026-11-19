@@ -7,6 +7,12 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions: [Sem
 
 ### Added
 
+- **`find refs <Symbol>`:** every place a symbol is mentioned, not only call targets: `use`, `new`, `instanceof`,
+  `catch`, `implements`/`extends`, `X::class`, `X::CONST`, property/parameter/return types, docblock and comments.
+  `--kind use,new,…` filters, `--files` prints one path per line (ready for `read`), `--json` for machines.
+- **`find text <pattern>`:** substring search over files outside the AST graph (`.neon`, `.yaml`, `.xml`, `.feature`,
+  `.env`, `.dist`); `--glob '*.neon,*.yaml'` filters (braces and `**` supported), `--files`, `--json`.
+- **`X::class` in `--const`:** class constants now include `::class` references (DI arrays, `Definition(Foo::class)`).
 - **Agent surface:** `map` (alias `locate`), `read <file[::method]>` (file → outline, method → body with type
   footnotes by default; `--body`, `--api`, `--flow`, `--lines`), `find def|callers|string|const`,
   `flow` (trace by default, `flow map` unchanged) and `skills get [--full]` (the built-in, version-matched skill).

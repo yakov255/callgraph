@@ -307,7 +307,6 @@ impl<'a, 'arena> Walker<'a, 'arena, State> for Collector<'_, '_> {
     fn walk_in_class_constant_access(&self, n: &ClassConstantAccess<'arena>, s: &mut State) {
         if let (Some(c), ClassLikeConstantSelector::Identifier(k)) =
             (self.class(n.class), &n.constant)
-            && k.value != b"class"
         {
             let x = self.push(
                 s,

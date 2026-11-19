@@ -243,6 +243,8 @@ The older commands below stay as aliases.
 | Method body with type footnotes | `callgraph read <file>::<method>` · expand: `callgraph refs <rN> <k>` |
 | Who calls it / impact | `callgraph find callers <name> [--depth N]` |
 | String / constant | `callgraph find string <text>` · `callgraph find const <NAME>` |
+| All references to a symbol (use/new/type/docblock/…) | `callgraph find refs <Symbol> [--kind use,new,…] [--files]` |
+| Text in non-AST files (neon/yaml/feature/env) | `callgraph find text <pattern> [--glob '*.neon,*.yaml']` |
 | Class file via composer autoload | `callgraph autoload <FQCN>... [--project <alias>]` |
 | Built-in skill | `callgraph skills get [--full]` |
 | Where do I start with this task? (old form) | `callgraph.sh locate <term>... [--all]` |
