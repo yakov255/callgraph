@@ -8,6 +8,9 @@ Angol változat: [CHANGELOG.md](CHANGELOG.md) — a kettő tartalma azonos.
 
 ### Új
 
+- **`--with-vendor` a `find refs` és `map` alatt:** a vendor fájlok külön elemződnek, nem kerülnek a projekt-gráfba;
+  egy csak `app/raketa/vendor`-on át használt osztály `--project vendor` nélkül is megtalálható.
+- **Többsoros szignatúra-lábjegyzetek:** a `--refs` a paraméter- és visszatérési típusokat a saját sorukon is jelöli.
 - **`find impl|sub|trait <Symbol>`:** pontos implementáció / leszármazott / trait-használó lista a gráf
   konténereiből (`--files`, `--json`).
 - **`find path <glob>`:** fájlkeresés út vagy név szerint (`*`, `?`, `**`, `{a,b}`), relatív utakkal.

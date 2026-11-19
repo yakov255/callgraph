@@ -7,6 +7,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions: [Sem
 
 ### Added
 
+- **`--with-vendor` for `find refs` and `map`:** vendor files are parsed separately and do not enter the project
+  graph; a class used only through `app/raketa/vendor` is found without `--project vendor`.
+- **Multi-line signature footnotes:** `--refs` marks parameter and return types on their own lines
+  (`function build(\n  Foo $x,\n): Bar`).
 - **`find impl|sub|trait <Symbol>`:** exact implementation / subclass / trait-user lists from the graph
   containers (`--files`, `--json`).
 - **`find path <glob>`:** file search by path or name (`*`, `?`, `**`, `{a,b}`), relative paths.

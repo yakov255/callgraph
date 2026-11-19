@@ -75,6 +75,7 @@ struct Pass<'a> {
     map: &'a AutoloadMap,
     file: &'a str,
     graph: &'a FileGraph,
+    source: &'a [String],
     numbered: &'a mut Numbered,
 }
 
@@ -83,7 +84,7 @@ impl Pass<'_> {
     fn line(&mut self, number: u32, text: &str) -> String {
         let container = container_for_line(self.graph, number);
         let mut inserts: Vec<(usize, String)> = Vec::new();
-        for (start, end) in type_spans(self.graph, number, text) {
+        for (start, end) in self.spans(number, text) {
             let ty = &text[start..end];
             for (_, offset, name) in types::named(ty) {
                 let fqcn = resolve_name(&name, self.graph, container);
@@ -93,53 +94,82 @@ impl Pass<'_> {
         }
         insert_markers(text, inserts)
     }
-}
 
-/// Позиции типов в отображаемой строке: сигнатура метода, docblock, свойство.
-fn type_spans(graph: &FileGraph, number: u32, text: &str) -> Vec<(usize, usize)> {
-    let mut out = Vec::new();
-    if let Some(method) = graph.methods.iter().find(|method| method.line == number) {
-        for param in &method.params {
-            let Some((ty, variable)) = param_type(param) else {
+    /// Типы в отображаемой строке: сигнатура (включая многострочную), docblock, свойство.
+    fn spans(&self, number: u32, text: &str) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        for method in &self.graph.methods {
+            if number < method.line || number > signature_end(self.source, method.line) {
                 continue;
-            };
-            let variable = format!("${variable}");
-            let Some(var_at) = text.find(&variable) else {
-                continue;
-            };
-            if let Some(start) = text[..var_at].rfind(ty) {
+            }
+            for param in &method.params {
+                let Some((ty, variable)) = param_type(param) else {
+                    continue;
+                };
+                let variable = format!("${variable}");
+                let Some(var_at) = text.find(&variable) else {
+                    continue;
+                };
+                if let Some(start) = text[..var_at].rfind(ty) {
+                    out.push((start, start + ty.len()));
+                }
+            }
+            if let Some(ret) = method
+                .return_type
+                .as_deref()
+                .filter(|ret| !ret.trim().is_empty())
+                && let Some(start) = text.rfind(ret)
+            {
+                out.push((start, start + ret.len()));
+            }
+        }
+        if let Some(span) = docblock_type_span(text) {
+            out.push(span);
+        }
+        if let Some(property) = self
+            .graph
+            .properties
+            .iter()
+            .find(|property| property.line == number)
+            && let Some(ty) = property
+                .type_hint
+                .as_deref()
+                .filter(|ty| !ty.trim().is_empty())
+        {
+            let variable = format!("${}", property.name);
+            if let Some(var_at) = text.find(&variable)
+                && let Some(start) = text[..var_at].rfind(ty)
+            {
                 out.push((start, start + ty.len()));
             }
         }
-        if let Some(ret) = method
-            .return_type
-            .as_deref()
-            .filter(|ret| !ret.trim().is_empty())
-            && let Some(start) = text.rfind(ret)
-        {
-            out.push((start, start + ret.len()));
+        out
+    }
+}
+
+/// Конец сигнатуры: строка, где закрывается список параметров (не дальше 30 строк).
+fn signature_end(source: &[String], start: u32) -> u32 {
+    let mut depth = 0i32;
+    let mut opened = false;
+    let first = start.saturating_sub(1) as usize;
+    for (offset, line) in source.iter().skip(first).take(30).enumerate() {
+        for ch in line.chars() {
+            match ch {
+                '(' => {
+                    depth += 1;
+                    opened = true;
+                }
+                ')' => {
+                    depth -= 1;
+                    if opened && depth <= 0 {
+                        return start + offset as u32;
+                    }
+                }
+                _ => {}
+            }
         }
     }
-    if let Some(span) = docblock_type_span(text) {
-        out.push(span);
-    }
-    if let Some(property) = graph
-        .properties
-        .iter()
-        .find(|property| property.line == number)
-        && let Some(ty) = property
-            .type_hint
-            .as_deref()
-            .filter(|ty| !ty.trim().is_empty())
-    {
-        let variable = format!("${}", property.name);
-        if let Some(var_at) = text.find(&variable)
-            && let Some(start) = text[..var_at].rfind(ty)
-        {
-            out.push((start, start + ty.len()));
-        }
-    }
-    out
+    start
 }
 
 /// Тип и имя переменной из параметра: `?Foo $x = null` → (`?Foo`, `x`).
@@ -338,14 +368,21 @@ pub fn annotate_body(text: &str, rows: &[QueryResult], root: &Path) -> String {
     let mut numbered = Numbered::new();
     let mut out = String::with_capacity(text.len() + 256);
     let mut file: Option<&str> = None;
+    let mut sources: HashMap<String, Vec<String>> = HashMap::new();
     for line in text.lines() {
         let annotated = match (file, numbered_line(line)) {
             (Some(file), Some((number, content))) => match graphs.get(file) {
                 Some(graph) => {
+                    let source = sources.entry(file.to_owned()).or_insert_with(|| {
+                        crate::io::read_source_lossy(Path::new(file))
+                            .map(|text| text.lines().map(str::to_owned).collect())
+                            .unwrap_or_default()
+                    });
                     let mut pass = Pass {
                         map: &map,
                         file,
                         graph,
+                        source,
                         numbered: &mut numbered,
                     };
                     format_numbered(number, &pass.line(number, content))
@@ -382,6 +419,9 @@ pub fn annotate_lines(
     lines: &[(u32, String)],
 ) -> (Vec<(u32, String)>, Vec<RefEntry>) {
     let map = AutoloadMap::discover(root);
+    let source: Vec<String> = crate::io::read_source_lossy(Path::new(file))
+        .map(|text| text.lines().map(str::to_owned).collect())
+        .unwrap_or_default();
     let mut numbered = Numbered::new();
     let mut out = Vec::with_capacity(lines.len());
     for (number, content) in lines {
@@ -389,6 +429,7 @@ pub fn annotate_lines(
             map: &map,
             file,
             graph,
+            source: &source,
             numbered: &mut numbered,
         };
         out.push((*number, pass.line(*number, content)));

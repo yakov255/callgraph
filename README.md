@@ -243,7 +243,8 @@ The older commands below stay as aliases.
 | Method body with type footnotes | `callgraph read <file>::<method>` · expand: `callgraph refs <rN> <k>` |
 | Who calls it / impact | `callgraph find callers <name> [--depth N]` |
 | String / constant | `callgraph find string <text>` · `callgraph find const <NAME>` |
-| All references to a symbol (use/new/type/docblock/…) | `callgraph find refs <Symbol> [--kind use,new,…] [--files]` |
+| All references to a symbol (use/new/type/docblock/…) | `callgraph find refs <Symbol> [--kind use,new,…] [--files] [--with-vendor]` |
+| Same, including vendor code | `callgraph find refs <Symbol> --with-vendor` · `callgraph map <term> --with-vendor` |
 | Implementations / subclasses / trait users | `callgraph find impl <Iface>` · `find sub <Class>` · `find trait <Trait>` |
 | Files by path or name | `callgraph find path '**/ErrorHandler/*.php'` |
 | Lines around a place, with method bounds | `callgraph context src/File.php:3222 -n 5` |

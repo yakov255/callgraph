@@ -13,6 +13,26 @@ use crate::io::FileWalker;
 use crate::lang::LanguageRole;
 use crate::model::FileGraph;
 
+/// Каталоги, которые пропускаем и в vendor (кроме самого vendor).
+fn vendor_skip_dirs() -> Vec<String> {
+    [
+        "node_modules",
+        ".git",
+        "cache",
+        "runtime",
+        "tmp",
+        ".idea",
+        ".junie",
+        "__pycache__",
+        "venv",
+        ".venv",
+        "site-packages",
+        "testdata",
+    ]
+    .map(String::from)
+    .to_vec()
+}
+
 /// Egy fájl a kereséshez: az abszolút út, a gráfja, és hogy kódfájl-e (nem dokumentum / adat).
 pub(crate) struct SourceFile<'g> {
     pub path: &'g Path,
@@ -26,6 +46,8 @@ pub(crate) struct ProjectSource<'a> {
     analyzer: &'a Analyzer,
     /// A projekt-gráfból olvasson-e (`CALLGRAPH_NO_GRAPH=1` kikapcsolja).
     graph: bool,
+    /// Индексировать ли vendor (по умолчанию нет: `.gitignore`).
+    vendor: bool,
 }
 
 impl<'a> ProjectSource<'a> {
@@ -34,7 +56,14 @@ impl<'a> ProjectSource<'a> {
             root,
             analyzer,
             graph: std::env::var_os("CALLGRAPH_NO_GRAPH").is_none(),
+            vendor: false,
         }
+    }
+
+    /// `--with-vendor`: vendor-файлы разбираются отдельно и не попадают в проектный граф.
+    pub(crate) fn with_vendor(mut self, vendor: bool) -> Self {
+        self.vendor = vendor;
+        self
     }
 
     /// A `visit` a projekt fájljaival (a bejárás sorrendjében); a gráfok kölcsönzöttek, a hívás idejére.
@@ -63,18 +92,64 @@ impl<'a> ProjectSource<'a> {
                 })
                 .filter(|file| !file.graph.binary)
                 .collect();
-            return Ok(visit(&rows));
+            if !self.vendor {
+                return Ok(visit(&rows));
+            }
+            let owned = self.vendor_graphs();
+            let vendor_rows: Vec<SourceFile<'_>> = owned
+                .iter()
+                .filter(|(_, graph)| !graph.binary)
+                .map(|(path, graph)| self.entry(path, graph))
+                .collect();
+            let combined: Vec<SourceFile<'_>> = rows.into_iter().chain(vendor_rows).collect();
+            return Ok(visit(&combined));
         }
         let graphs: Vec<(&PathBuf, FileGraph)> = files
             .par_iter()
             .filter_map(|path| Some((path, self.analyzer.analyze_path(path).ok()?.graph)))
             .collect();
-        let rows: Vec<SourceFile<'_>> = graphs
+        let mut rows: Vec<SourceFile<'_>> = graphs
             .iter()
             .filter(|(_, graph)| !graph.binary)
             .map(|(path, graph)| self.entry(path, graph))
             .collect();
+        let owned = if self.vendor {
+            self.vendor_graphs()
+        } else {
+            Vec::new()
+        };
+        let vendor_rows: Vec<SourceFile<'_>> = owned
+            .iter()
+            .filter(|(_, graph)| !graph.binary)
+            .map(|(path, graph)| self.entry(path, graph))
+            .collect();
+        rows.extend(vendor_rows);
         Ok(visit(&rows))
+    }
+
+    /// Файлы vendor: отдельный разбор, без записи в проектный граф.
+    fn vendor_graphs(&self) -> Vec<(PathBuf, FileGraph)> {
+        let map = crate::autoload::AutoloadMap::discover(self.root);
+        let mut dirs: Vec<PathBuf> = map
+            .roots()
+            .map(|(_, vendor)| vendor.to_path_buf())
+            .collect();
+        dirs.sort();
+        dirs.dedup();
+        let mut files = Vec::new();
+        for dir in dirs {
+            if !dir.is_dir() {
+                continue;
+            }
+            let walker = FileWalker::for_registry(self.analyzer.registry())
+                .with_gitignore(false)
+                .with_skip_dirs(vendor_skip_dirs());
+            files.extend(walker.collect(&[dir], &mut |_| {}));
+        }
+        files
+            .par_iter()
+            .filter_map(|path| Some((path.clone(), self.analyzer.analyze_path(path).ok()?.graph)))
+            .collect()
     }
 
     fn entry<'g>(&self, path: &'g Path, graph: &'g FileGraph) -> SourceFile<'g> {

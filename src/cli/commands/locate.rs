@@ -15,6 +15,7 @@ pub struct LocateCommand {
     files: bool,
     json: bool,
     exact: bool,
+    with_vendor: bool,
     project: Option<String>,
     home: SkillHome,
 }
@@ -27,6 +28,7 @@ impl LocateCommand {
         files: bool,
         json: bool,
         exact: bool,
+        with_vendor: bool,
         project: Option<String>,
         home: SkillHome,
     ) -> Self {
@@ -36,6 +38,7 @@ impl LocateCommand {
             files,
             json,
             exact,
+            with_vendor,
             project,
             home,
         }
@@ -51,6 +54,7 @@ impl Command for LocateCommand {
             self.exact,
             self.files,
             self.json,
+            self.with_vendor,
         )?;
         out.write_all(text.as_bytes())?;
         Ok(crate::cli::strict::exit_code(broken > 0))

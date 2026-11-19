@@ -217,6 +217,7 @@ pub enum CliArgs {
         files: bool,
         json: bool,
         exact: bool,
+        with_vendor: bool,
         project: Option<String>,
     },
     /// `uses <csomag> [--calls]`: hol és hogyan használja a projekt egy függőségét; `calls`: fájlonként minden
@@ -320,6 +321,7 @@ pub enum CliArgs {
         kinds: Option<Vec<String>>,
         files: bool,
         json: bool,
+        with_vendor: bool,
         project: Option<String>,
     },
     /// `skills get [core] [--full]`: встроенный скилл (версия совпадает с бинарником).
@@ -727,12 +729,14 @@ impl CliArgs {
         let mut kinds = None;
         let mut files = false;
         let mut json = false;
+        let mut with_vendor = false;
         let mut project = None;
         let mut i = 0;
         while i < args.len() {
             match args[i].as_str() {
                 "--files" => files = true,
                 "--json" => json = true,
+                "--with-vendor" => with_vendor = true,
                 "--kind" if i + 1 < args.len() => {
                     kinds = Some(args[i + 1].split(',').map(str::to_owned).collect());
                     i += 1;
@@ -757,6 +761,7 @@ impl CliArgs {
             kinds,
             files,
             json,
+            with_vendor,
             project,
         })
     }
@@ -1304,6 +1309,7 @@ impl CliArgs {
         let mut files = false;
         let mut json = false;
         let mut exact = false;
+        let mut with_vendor = false;
         let mut i = 0;
         while i < args.len() {
             match args[i].as_str() {
@@ -1315,6 +1321,7 @@ impl CliArgs {
                 "--files" => files = true,
                 "--json" => json = true,
                 "--exact" => exact = true,
+                "--with-vendor" => with_vendor = true,
                 "--project" if i + 1 < args.len() => {
                     project = Some(args[i + 1].clone());
                     i += 1;
@@ -1339,6 +1346,7 @@ impl CliArgs {
             files,
             json,
             exact,
+            with_vendor,
             project,
         })
     }
@@ -1826,6 +1834,7 @@ mod tests {
                 files: false,
                 json: false,
                 exact: false,
+                with_vendor: false,
                 project: Some("sp".into()),
             }
         );
@@ -1837,6 +1846,7 @@ mod tests {
                 files: false,
                 json: false,
                 exact: false,
+                with_vendor: false,
                 project: Some("/x".into()),
             }
         );
@@ -1851,6 +1861,7 @@ mod tests {
                 files: false,
                 json: false,
                 exact: false,
+                with_vendor: false,
                 project: None,
             }
         );

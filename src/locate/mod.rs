@@ -62,7 +62,7 @@ impl Locator {
     /// A kifejezésekre adott válasz szövege és a szintaktikai hibás fájlok száma (`--strict`); `all`: minden egyező
     /// fájl (alapból az első 5). Kifejezés nélkül használati hiba.
     pub fn run<S: AsRef<str>>(&self, inputs: &[S], all: bool) -> Result<(String, usize)> {
-        self.run_options(inputs, all, false, false, false)
+        self.run_options(inputs, all, false, false, false, false)
     }
 
     /// Как `run`, но с машинным выводом: `exact` — только точные определения/имена файлов,
@@ -74,8 +74,9 @@ impl Locator {
         exact: bool,
         files: bool,
         json: bool,
+        with_vendor: bool,
     ) -> Result<(String, usize)> {
-        let located = self.data(inputs, exact)?;
+        let located = self.data(inputs, exact, with_vendor)?;
         let issues = located.issues.len();
         if files {
             let mut text = String::new();
@@ -129,7 +130,12 @@ impl Locator {
     }
 
     /// Сырые данные locate: термины, ранжированные файлы, заметки и ошибки разбора.
-    pub(crate) fn data<S: AsRef<str>>(&self, inputs: &[S], exact: bool) -> Result<Located> {
+    pub(crate) fn data<S: AsRef<str>>(
+        &self,
+        inputs: &[S],
+        exact: bool,
+        with_vendor: bool,
+    ) -> Result<Located> {
         let terms = Term::parse_all(inputs);
         if terms.is_empty() {
             return Err(CallgraphError::Usage(usage().into()));
@@ -144,8 +150,9 @@ impl Locator {
             Inertia::detect(&self.root, packages, &crate::packages::DiskProjectFiles)
         });
         let mut notes: HashMap<String, usize> = HashMap::new();
-        let (mut ranked, issues) =
-            ProjectSource::new(&self.root, &self.analyzer).with_files(|files| {
+        let (mut ranked, issues) = ProjectSource::new(&self.root, &self.analyzer)
+            .with_vendor(with_vendor)
+            .with_files(|files| {
                 if let Some(inertia) = inertia.as_mut() {
                     let code = files
                         .iter()

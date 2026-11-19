@@ -27,6 +27,7 @@ pub struct FindRefsCommand {
     kinds: Option<Vec<String>>,
     files_only: bool,
     json: bool,
+    with_vendor: bool,
     project: Option<String>,
     home: SkillHome,
 }
@@ -37,6 +38,7 @@ impl FindRefsCommand {
         kinds: Option<Vec<String>>,
         files_only: bool,
         json: bool,
+        with_vendor: bool,
         project: Option<String>,
         home: SkillHome,
     ) -> Self {
@@ -45,6 +47,7 @@ impl FindRefsCommand {
             kinds,
             files_only,
             json,
+            with_vendor,
             project,
             home,
         }
@@ -89,6 +92,9 @@ impl Command for FindRefsCommand {
                     text: line.trim().chars().take(160).collect(),
                 });
             }
+        }
+        if self.with_vendor {
+            vendor_hits(&root, target, short, fqcn, self.kinds.as_deref(), &mut hits);
         }
         hits.sort_by(|a, b| (&a.file, a.line).cmp(&(&b.file, b.line)));
         hits.dedup_by(|a, b| a.file == b.file && a.line == b.line);
@@ -288,6 +294,88 @@ fn classify(line: &str, name: &str) -> &'static str {
         }
     }
     "type"
+}
+
+/// Ссылки в vendor: без графа, поэтому только точное имя (FQCN или короткое).
+fn vendor_hits(
+    root: &Path,
+    target: &str,
+    short: &str,
+    fqcn: Option<&str>,
+    kinds: Option<&[String]>,
+    hits: &mut Vec<Hit>,
+) {
+    let map = crate::autoload::AutoloadMap::discover(root);
+    let mut vendors: Vec<PathBuf> = map
+        .roots()
+        .map(|(_, vendor)| vendor.to_path_buf())
+        .collect();
+    vendors.sort();
+    vendors.dedup();
+    for vendor in vendors {
+        walk_php(&vendor, 0, &mut |path, text| {
+            let names: &[&str] = if fqcn.is_some() {
+                &[short, target]
+            } else {
+                &[short]
+            };
+            for (index, line) in text.lines().enumerate() {
+                let Some(name) = names.iter().find(|name| has_word(line, name)) else {
+                    continue;
+                };
+                let kind = classify(line, name);
+                if let Some(filter) = kinds
+                    && !filter.iter().any(|wanted| wanted == kind)
+                {
+                    continue;
+                }
+                hits.push(Hit {
+                    file: path.display().to_string(),
+                    line: index as u32 + 1,
+                    kind,
+                    text: line.trim().chars().take(160).collect(),
+                });
+            }
+        });
+    }
+}
+
+/// Обход `.php` в vendor с ограничениями.
+fn walk_php(dir: &Path, depth: usize, visit: &mut dyn FnMut(&Path, &str)) {
+    if depth > 12 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .collect();
+    paths.sort();
+    for path in paths {
+        if path.is_dir() {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            if !matches!(name, "node_modules" | ".git") {
+                walk_php(&path, depth + 1, visit);
+            }
+            continue;
+        }
+        if path.extension().and_then(|ext| ext.to_str()) != Some("php") {
+            continue;
+        }
+        let Ok(meta) = path.metadata() else {
+            continue;
+        };
+        if meta.len() > 4 * 1024 * 1024 {
+            continue;
+        }
+        if let Ok(text) = crate::io::read_source_lossy(&path) {
+            visit(&path, &text);
+        }
+    }
 }
 
 fn relative(root: &Path, path: &Path) -> String {
