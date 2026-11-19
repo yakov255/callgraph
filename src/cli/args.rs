@@ -17,8 +17,8 @@ use super::uses_args::{parse_deps, parse_uses};
 
 fn usage() -> &'static str {
     crate::t!(
-        "callgraph [--lang <id,...>] [--cache <file>] [--no-cache] <file|dir> [...] | callgraph prune [--cache <file>] [--dry-run] | callgraph set-lang [en|hu] | callgraph self-update [--check] | callgraph note add|list|rm … | callgraph refresh [--project <alias|dir>] [--background] [<path>…] | callgraph locate <term>... [--all] [--project <alias|dir>] | callgraph hook install|uninstall|status | callgraph stats [--events] [--days N] | callgraph flow map [--project <alias|dir>] [--json] [--table <name>] [--full] | callgraph trace <term>... [--project <alias|dir>] [--json] [--full] [--must] | callgraph map <term>... | callgraph read <path[::method]> [--body|--api|--flow|--lines N-M] | callgraph find <def|callers|string|const> <value> | callgraph flow <term>... | callgraph skills get [--full] | callgraph autoload <Class>... [--project <alias|dir>] [--json] | callgraph refs <rN> <k> [--project <alias|dir>] | callgraph mcp [--auto-update] | callgraph --version  (any command: --no-gitignore = ignore the .gitignore files)",
-        "callgraph [--lang <id,...>] [--cache <fájl>] [--no-cache] <fájl|mappa> [...] | callgraph prune [--cache <fájl>] [--dry-run] | callgraph set-lang [en|hu] | callgraph self-update [--check] | callgraph note add|list|rm … | callgraph refresh [--project <alias|mappa>] [--background] [<út>…] | callgraph locate <kifejezés>... [--all] [--project <alias|mappa>] | callgraph hook install|uninstall|status | callgraph stats [--events] [--days N] | callgraph flow map [--project <alias|mappa>] [--json] [--table <név>] [--full] | callgraph trace <kifejezés>... [--project <alias|mappa>] [--json] [--full] [--must] | callgraph map <kifejezés>... | callgraph read <út[::metódus]> [--body|--api|--flow|--lines N-M] | callgraph find <def|callers|string|const> <érték> | callgraph flow <kifejezés>... | callgraph skills get [--full] | callgraph autoload <Osztály>... [--project <alias|mappa>] [--json] | callgraph refs <rN> <k> [--project <alias|mappa>] | callgraph mcp [--auto-update] | callgraph --version  (bármely parancsnál: --no-gitignore = a .gitignore fájlok nélkül)"
+        "callgraph [--lang <id,...>] [--cache <file>] [--no-cache] <file|dir> [...] | callgraph prune [--cache <file>] [--dry-run] | callgraph set-lang [en|hu] | callgraph self-update [--check] | callgraph note add|list|rm … | callgraph refresh [--project <alias|dir>] [--background] [<path>…] | callgraph locate <term>... [--all] [--project <alias|dir>] | callgraph hook install|uninstall|status | callgraph stats [--events] [--days N] | callgraph flow map [--project <alias|dir>] [--json] [--table <name>] [--full] | callgraph trace <term>... [--project <alias|dir>] [--json] [--full] [--must] | callgraph map <term>... | callgraph read <path[::method]> [--body|--api|--flow|--lines N-M] | callgraph find <def|callers|string|const> <value> | callgraph flow <term>... | callgraph skills get [--full] | callgraph autoload <Class>... [--project <alias|dir>] [--json] | callgraph refs <rN> <k> [--project <alias|dir>] | callgraph next <rN> <k> | callgraph mcp [--auto-update] | callgraph --version  (any command: --no-gitignore = ignore the .gitignore files)",
+        "callgraph [--lang <id,...>] [--cache <fájl>] [--no-cache] <fájl|mappa> [...] | callgraph prune [--cache <fájl>] [--dry-run] | callgraph set-lang [en|hu] | callgraph self-update [--check] | callgraph note add|list|rm … | callgraph refresh [--project <alias|mappa>] [--background] [<út>…] | callgraph locate <kifejezés>... [--all] [--project <alias|mappa>] | callgraph hook install|uninstall|status | callgraph stats [--events] [--days N] | callgraph flow map [--project <alias|mappa>] [--json] [--table <név>] [--full] | callgraph trace <kifejezés>... [--project <alias|mappa>] [--json] [--full] [--must] | callgraph map <kifejezés>... | callgraph read <út[::metódus]> [--body|--api|--flow|--lines N-M] | callgraph find <def|callers|string|const> <érték> | callgraph flow <kifejezés>... | callgraph skills get [--full] | callgraph autoload <Osztály>... [--project <alias|mappa>] [--json] | callgraph refs <rN> <k> [--project <alias|mappa>] | callgraph next <rN> <k> | callgraph mcp [--auto-update] | callgraph --version  (bármely parancsnál: --no-gitignore = a .gitignore fájlok nélkül)"
     )
 }
 
@@ -1473,6 +1473,21 @@ impl CliArgs {
                 cache = Some(PathBuf::from(value));
             } else if let Some(value) = arg.strip_prefix("--cache=") {
                 cache = Some(PathBuf::from(value));
+            } else if arg == "--project" {
+                // анализ идёт по путям; общий тестовый/скриптовый флаг принимаем и игнорируем
+                it.next();
+            } else if arg.starts_with("--project=") {
+                // то же, в форме `--project=...`
+            } else if arg == "--" {
+                paths.extend(it.by_ref().map(PathBuf::from));
+                break;
+            } else if arg.starts_with('-') && arg.len() > 1 {
+                // `callgraph <path> --project x`: flags are not parsed on the bare path — say so instead of
+                // treating the flag as a path and printing the raw JSON of the wrong file.
+                return Err(CallgraphError::Usage(crate::tf!(
+                    "unknown option {arg} on a bare path; use: callgraph show <path> ... (or --refs/--body via show)",
+                    "ismeretlen kapcsoló egy csupasz úton: {arg}; használd: callgraph show <út> ..."
+                )));
             } else {
                 paths.push(PathBuf::from(arg));
             }
@@ -1557,6 +1572,24 @@ mod tests {
             parse(&["a"]).unwrap(),
             CliArgs::Analyze {
                 paths: vec![PathBuf::from("a")],
+                lang: None,
+                cache: None,
+                no_cache: false
+            }
+        );
+    }
+
+    #[test]
+    fn bare_path_rejects_flags() {
+        // `callgraph file.php --project x` не должен печатать JSON чужого файла
+        assert!(parse(&["a.php", "--grep", "x"]).is_err());
+        assert!(parse(&["a.php", "--refs"]).is_err());
+        assert!(parse(&["a.php", "--project", "x"]).is_ok());
+        // явный `--`: имена файлов, начинающиеся с дефиса
+        assert_eq!(
+            parse(&["--", "-odd.php"]).unwrap(),
+            CliArgs::Analyze {
+                paths: vec![PathBuf::from("-odd.php")],
                 lang: None,
                 cache: None,
                 no_cache: false

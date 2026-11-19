@@ -6,6 +6,12 @@ Angol változat: [CHANGELOG.md](CHANGELOG.md) — a kettő tartalma azonos.
 
 ## [Unreleased]
 
+### Javítás
+
+- **Csupasz út kapcsolókkal:** a `callgraph file.php --project x` eddig a kapcsolókat útvonalnak vette, és egy másik
+  fájl nyers JSON-ját írta ki; most használati hiba. Valódi JSON: `show <path> --format json`; a `--project`
+  önmagában figyelmen kívül marad az elemzési úton, a `--` pedig engedi a `-`-sal kezdődő fájlneveket.
+
 ### Új
 
 - **`--with-vendor` a `find refs` és `map` alatt:** a vendor fájlok külön elemződnek, nem kerülnek a projekt-gráfba;

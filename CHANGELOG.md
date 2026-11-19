@@ -5,6 +5,12 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions: [Sem
 
 ## [Unreleased]
 
+### Fixed
+
+- **Bare path with flags:** `callgraph file.php --project x` used to treat flags as paths and print the raw JSON of a
+  wrong file; it is now a usage error. A real JSON dump is `show <path> --format json`; `--project` alone is ignored
+  on the analyze path, and `--` allows file names starting with a dash.
+
 ### Added
 
 - **`--with-vendor` for `find refs` and `map`:** vendor files are parsed separately and do not enter the project
