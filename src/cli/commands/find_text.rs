@@ -13,7 +13,7 @@ use crate::error::{CallgraphError, Result};
 use crate::skill::SkillHome;
 
 /// Каталоги, которые не обходим.
-const SKIP: &[&str] = &[
+pub(crate) const SKIP: &[&str] = &[
     "vendor",
     "node_modules",
     ".git",
@@ -178,7 +178,7 @@ fn walk(
 }
 
 /// `{neon,yaml}` → несколько шаблонов.
-fn expand_globs(globs: &[String]) -> Vec<String> {
+pub(crate) fn expand_globs(globs: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     for glob in globs {
         if let (Some(open), Some(close)) = (glob.find('{'), glob.find('}'))
@@ -196,7 +196,7 @@ fn expand_globs(globs: &[String]) -> Vec<String> {
 }
 
 /// Простой glob: `*` (кроме `/`), `?`, `**` (любая глубина).
-fn glob_match(pattern: &str, text: &str) -> bool {
+pub(crate) fn glob_match(pattern: &str, text: &str) -> bool {
     fn go(pattern: &[char], text: &[char]) -> bool {
         match pattern.first() {
             None => text.is_empty(),

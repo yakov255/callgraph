@@ -113,6 +113,54 @@ pub fn build_command(args: CliArgs) -> Result<Box<dyn Command>> {
             json,
             crate::skill::SkillHome::from_env(),
         ))),
+        CliArgs::Context {
+            target,
+            around,
+            project,
+        } => Ok(Box::new(commands::ContextCommand::new(
+            target,
+            around,
+            project,
+            crate::skill::SkillHome::from_env(),
+        ))),
+        CliArgs::FindCallersJson { name, project } => {
+            Ok(Box::new(commands::FindCallersJsonCommand::new(
+                name,
+                project,
+                crate::skill::SkillHome::from_env(),
+            )))
+        }
+        CliArgs::FindPath {
+            glob,
+            json,
+            project,
+        } => Ok(Box::new(commands::FindPathCommand::new(
+            glob,
+            json,
+            project,
+            crate::skill::SkillHome::from_env(),
+        ))),
+        CliArgs::FindRelation {
+            relation,
+            symbol,
+            files,
+            json,
+            project,
+        } => {
+            let relation = commands::Relation::parse(&relation).ok_or_else(|| {
+                crate::error::CallgraphError::Usage(
+                    crate::t!("find: unknown relation", "find: ismeretlen kapcsolat").into(),
+                )
+            })?;
+            Ok(Box::new(commands::FindRelationCommand::new(
+                relation,
+                symbol,
+                files,
+                json,
+                project,
+                crate::skill::SkillHome::from_env(),
+            )))
+        }
         CliArgs::FindText {
             pattern,
             globs,
@@ -179,10 +227,16 @@ pub fn build_command(args: CliArgs) -> Result<Box<dyn Command>> {
         CliArgs::Locate {
             terms,
             all,
+            files,
+            json,
+            exact,
             project,
         } => Ok(Box::new(commands::LocateCommand::new(
             terms,
             all,
+            files,
+            json,
+            exact,
             project,
             crate::skill::SkillHome::from_env(),
         ))),

@@ -29,10 +29,20 @@ use callers::CallerCounts;
 use format::Report;
 use matcher::Matcher;
 use rank::{FileMatch, rank};
+use reasons::{describe, group, pick};
 use terms::Term;
 
 // a projekt fájljainak forrása: a `uses` csomag-használat is ezen át járja be a projekt-gráfot
 pub(crate) use source::ProjectSource;
+
+/// Сырые данные ответа `locate` (для текстового, `--files` и `--json` вывода).
+pub(crate) struct Located {
+    pub root: PathBuf,
+    pub terms: Vec<Term>,
+    pub ranked: Vec<FileMatch>,
+    pub notes: HashMap<String, usize>,
+    pub issues: Vec<(String, u32)>,
+}
 
 /// A kiindulópont-kereső egy projekt-gyökérre.
 pub struct Locator {
@@ -52,6 +62,74 @@ impl Locator {
     /// A kifejezésekre adott válasz szövege és a szintaktikai hibás fájlok száma (`--strict`); `all`: minden egyező
     /// fájl (alapból az első 5). Kifejezés nélkül használati hiba.
     pub fn run<S: AsRef<str>>(&self, inputs: &[S], all: bool) -> Result<(String, usize)> {
+        self.run_options(inputs, all, false, false, false)
+    }
+
+    /// Как `run`, но с машинным выводом: `exact` — только точные определения/имена файлов,
+    /// `files` — по пути на строку, `json` — структура.
+    pub fn run_options<S: AsRef<str>>(
+        &self,
+        inputs: &[S],
+        all: bool,
+        exact: bool,
+        files: bool,
+        json: bool,
+    ) -> Result<(String, usize)> {
+        let located = self.data(inputs, exact)?;
+        let issues = located.issues.len();
+        if files {
+            let mut text = String::new();
+            for file in &located.ranked {
+                text.push_str(&file.path);
+                text.push('\n');
+            }
+            return Ok((text, issues));
+        }
+        if json {
+            let items: Vec<serde_json::Value> = located
+                .ranked
+                .iter()
+                .map(|file| {
+                    let reasons: Vec<String> = pick(group(&file.hits), 3)
+                        .iter()
+                        .map(|reason| describe(reason, &located.terms))
+                        .collect();
+                    serde_json::json!({
+                        "path": file.path,
+                        "score": file.score,
+                        "exact": file.has_exact(),
+                        "reasons": reasons,
+                    })
+                })
+                .collect();
+            let text = serde_json::json!({
+                "root": located.root,
+                "files": items,
+            })
+            .to_string();
+            return Ok((text, issues));
+        }
+        let root = located.root.to_string_lossy();
+        let shown = crate::query::strip_verbatim(&root);
+        let branch = crate::query::branch::root_suffix(&located.root);
+        let mut text = crate::tf!("root: {shown}{branch}\n", "gyökér: {shown}{branch}\n");
+        let report = Report {
+            terms: &located.terms,
+            ranked: &located.ranked,
+            all,
+            notes: &located.notes,
+            root: &located.root,
+        };
+        text.push_str(&report.render());
+        text.push_str(&crate::query::format::parse_trailer(
+            &located.issues,
+            crate::i18n::lang(),
+        ));
+        Ok((text, issues))
+    }
+
+    /// Сырые данные locate: термины, ранжированные файлы, заметки и ошибки разбора.
+    pub(crate) fn data<S: AsRef<str>>(&self, inputs: &[S], exact: bool) -> Result<Located> {
         let terms = Term::parse_all(inputs);
         if terms.is_empty() {
             return Err(CallgraphError::Usage(usage().into()));
@@ -66,7 +144,7 @@ impl Locator {
             Inertia::detect(&self.root, packages, &crate::packages::DiskProjectFiles)
         });
         let mut notes: HashMap<String, usize> = HashMap::new();
-        let (ranked, issues) =
+        let (mut ranked, issues) =
             ProjectSource::new(&self.root, &self.analyzer).with_files(|files| {
                 if let Some(inertia) = inertia.as_mut() {
                     let code = files
@@ -76,7 +154,6 @@ impl Locator {
                     inertia.scan(code, &crate::packages::DiskProjectFiles);
                 }
                 let inertia = inertia.as_ref();
-                // a szintaktikai hibás fájlok a záró sorhoz (a rangsoruk hiányos térképből jön)
                 let issues: Vec<(String, u32)> = files
                     .iter()
                     .filter_map(|file| {
@@ -97,7 +174,6 @@ impl Locator {
                             }
                         }
                         if !hits.is_empty() && !marks.is_empty() {
-                            // az árva (a fájlban már nem létező metódusra szóló) jegyzetek nem számítanak
                             let methods = file.graph.methods.iter();
                             let n = crate::notes::live_count(
                                 marks.of(&rel),
@@ -107,34 +183,23 @@ impl Locator {
                                 notes.insert(rel.clone(), n);
                             }
                         }
-                        // a több kifejezést egyesítő azonosító (erős jel a rangsorban)
                         let multi = matcher.multi_terms(&hits);
                         FileMatch::new(rel, hits).map(|file| file.with_multi(multi))
                     })
                     .collect();
-                // a teszt-felismerés a gyökérhez relatív úton (a gyökér útja maga ne számítson)
                 let ranked = rank(matched, rank::is_test_path);
                 (ranked, issues)
             })?;
-        // mindig a `root:` sorral és a gyökérhez relatív utakkal (egyetlen találatnál is), a többi lekérdezéssel
-        // azonos alakban
-        let root = self.root.to_string_lossy();
-        let shown = crate::query::strip_verbatim(&root);
-        let branch = crate::query::branch::root_suffix(&self.root);
-        let mut text = crate::tf!("root: {shown}{branch}\n", "gyökér: {shown}{branch}\n");
-        let report = Report {
-            terms: &terms,
-            ranked: &ranked,
-            all,
-            notes: &notes,
-            root: &self.root,
-        };
-        text.push_str(&report.render());
-        text.push_str(&crate::query::format::parse_trailer(
-            &issues,
-            crate::i18n::lang(),
-        ));
-        Ok((text, issues.len()))
+        if exact {
+            ranked.retain(FileMatch::has_exact);
+        }
+        Ok(Located {
+            root: self.root.clone(),
+            terms,
+            ranked,
+            notes,
+            issues,
+        })
     }
 
     /// Az út a gyökérhez képest (a fájlnév- és út-egyezéshez).

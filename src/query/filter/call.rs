@@ -28,7 +28,12 @@ pub(crate) fn receiver_target(graph: &FileGraph, call: &Call) -> Option<String> 
 }
 
 /// A minta: a hívás-célra illeszkedő regex, vagy (ha van) a rokon típuson át hívott keresett metódus.
-struct RegexSpec(Regex, Option<ViaMatcher>);
+struct RegexSpec {
+    pattern: Regex,
+    via: Option<ViaMatcher>,
+    /// `X::__construct` mintához: `new X` is számít (a konstruktor hívás nem `::__construct` célként jelenik meg).
+    constructor: Option<Regex>,
+}
 impl CallFilter for RegexSpec {
     fn matches(&self, graph: &FileGraph, call: &Call) -> bool {
         // a dinamikus hívás jelölés, nem hívó-él: a `--grep` nem találja meg (csak a `--category dynamic_call`)
@@ -36,15 +41,25 @@ impl CallFilter for RegexSpec {
             return false;
         }
         let target = call.resolved.as_deref().unwrap_or(&call.target);
+        if let Some(constructor) = &self.constructor
+            && call.category == "instantiation"
+            && (constructor.is_match(target) || crate::index::uncertain_match(constructor, target))
+        {
+            return true;
+        }
         // `?::név` (feloldatlan fogadó): a `Típus::név` minta név szerint illeszkedik rá
-        if self.0.is_match(target)
-            || crate::index::uncertain_match(&self.0, target)
-            || self.1.as_ref().is_some_and(|via| via.via(target).is_some())
+        if self.pattern.is_match(target)
+            || crate::index::uncertain_match(&self.pattern, target)
+            || self
+                .via
+                .as_ref()
+                .is_some_and(|via| via.via(target).is_some())
         {
             return true;
         }
         receiver_target(graph, call).is_some_and(|own| {
-            self.0.is_match(&own) || self.1.as_ref().is_some_and(|via| via.via(&own).is_some())
+            self.pattern.is_match(&own)
+                || self.via.as_ref().is_some_and(|via| via.via(&own).is_some())
         })
     }
 }
@@ -75,7 +90,16 @@ impl FilterChain {
     ) -> Result<Self, regex::Error> {
         let mut specs: Vec<Box<dyn CallFilter>> = Vec::new();
         if let Some(pattern) = pattern {
-            specs.push(Box::new(RegexSpec(pattern_regex(pattern)?, via)));
+            let regex = pattern_regex(pattern)?;
+            let constructor = pattern
+                .strip_suffix("::__construct")
+                .map(pattern_regex)
+                .transpose()?;
+            specs.push(Box::new(RegexSpec {
+                pattern: regex,
+                via,
+                constructor,
+            }));
         }
         if let Some(categories) = categories {
             specs.push(Box::new(CategorySpec(categories.to_vec())));

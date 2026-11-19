@@ -244,6 +244,11 @@ The older commands below stay as aliases.
 | Who calls it / impact | `callgraph find callers <name> [--depth N]` |
 | String / constant | `callgraph find string <text>` · `callgraph find const <NAME>` |
 | All references to a symbol (use/new/type/docblock/…) | `callgraph find refs <Symbol> [--kind use,new,…] [--files]` |
+| Implementations / subclasses / trait users | `callgraph find impl <Iface>` · `find sub <Class>` · `find trait <Trait>` |
+| Files by path or name | `callgraph find path '**/ErrorHandler/*.php'` |
+| Lines around a place, with method bounds | `callgraph context src/File.php:3222 -n 5` |
+| Several ranges in one call | `callgraph read <file> --lines 745-790 --lines 3850-3875` |
+| Exact definitions only, paths or JSON | `callgraph map <term> --exact` · `--files` · `--json` |
 | Text in non-AST files (neon/yaml/feature/env) | `callgraph find text <pattern> [--glob '*.neon,*.yaml']` |
 | Class file via composer autoload | `callgraph autoload <FQCN>... [--project <alias>]` |
 | Built-in skill | `callgraph skills get [--full]` |

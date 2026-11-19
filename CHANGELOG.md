@@ -7,6 +7,15 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions: [Sem
 
 ### Added
 
+- **`find impl|sub|trait <Symbol>`:** exact implementation / subclass / trait-user lists from the graph
+  containers (`--files`, `--json`).
+- **`find path <glob>`:** file search by path or name (`*`, `?`, `**`, `{a,b}`), relative paths.
+- **`context <file>:<line> [-n N]`:** lines around a place, target line marked, method bounds from the map.
+- **Several `--lines` in one call:** `--lines 745-790 --lines 3850-3875`.
+- **`locate`/`map` output modes:** `--exact` (definitions and file names only), `--files` (one path per line),
+  `--json` (path, score, reasons).
+- **`find callers --json`:** direct calls as JSON (depth 1; deeper levels keep the text output).
+- **`X::__construct` in `--grep`/`find callers`:** matches `new X` call sites too.
 - **`find refs <Symbol>`:** every place a symbol is mentioned, not only call targets: `use`, `new`, `instanceof`,
   `catch`, `implements`/`extends`, `X::class`, `X::CONST`, property/parameter/return types, docblock and comments.
   `--kind use,new,…` filters, `--files` prints one path per line (ready for `read`), `--json` for machines.

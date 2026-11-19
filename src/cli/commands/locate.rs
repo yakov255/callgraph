@@ -12,15 +12,30 @@ use crate::skill::SkillHome;
 pub struct LocateCommand {
     terms: Vec<String>,
     all: bool,
+    files: bool,
+    json: bool,
+    exact: bool,
     project: Option<String>,
     home: SkillHome,
 }
 
 impl LocateCommand {
-    pub fn new(terms: Vec<String>, all: bool, project: Option<String>, home: SkillHome) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        terms: Vec<String>,
+        all: bool,
+        files: bool,
+        json: bool,
+        exact: bool,
+        project: Option<String>,
+        home: SkillHome,
+    ) -> Self {
         Self {
             terms,
             all,
+            files,
+            json,
+            exact,
             project,
             home,
         }
@@ -30,7 +45,13 @@ impl LocateCommand {
 impl Command for LocateCommand {
     fn run(&self, out: &mut dyn Write, _err: &mut dyn Write) -> Result<i32> {
         let root = super::project_root(&self.home, self.project.as_deref())?;
-        let (text, broken) = Locator::new(&root).run(&self.terms, self.all)?;
+        let (text, broken) = Locator::new(&root).run_options(
+            &self.terms,
+            self.all || self.files,
+            self.exact,
+            self.files,
+            self.json,
+        )?;
         out.write_all(text.as_bytes())?;
         Ok(crate::cli::strict::exit_code(broken > 0))
     }

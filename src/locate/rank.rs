@@ -64,6 +64,13 @@ impl FileMatch {
         self
     }
 
+    /// Есть ли точное совпадение: определение или имя файла (для `locate --exact`).
+    pub(crate) fn has_exact(&self) -> bool {
+        self.hits
+            .iter()
+            .any(|hit| hit.kind <= super::matcher::Kind::FileName)
+    }
+
     /// A fájlban egyező kifejezések (index), növekvő sorrendben, ismétlés nélkül.
     pub(crate) fn terms(&self) -> Vec<usize> {
         let mut terms: Vec<usize> = self.hits.iter().map(|hit| hit.term).collect();

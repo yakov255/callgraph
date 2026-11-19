@@ -8,6 +8,15 @@ Angol változat: [CHANGELOG.md](CHANGELOG.md) — a kettő tartalma azonos.
 
 ### Új
 
+- **`find impl|sub|trait <Symbol>`:** pontos implementáció / leszármazott / trait-használó lista a gráf
+  konténereiből (`--files`, `--json`).
+- **`find path <glob>`:** fájlkeresés út vagy név szerint (`*`, `?`, `**`, `{a,b}`), relatív utakkal.
+- **`context <fájl>:<sor> [-n N]`:** sorok a hely körül, a célsor `>` jelöléssel, metódus-határokkal.
+- **Több `--lines` egy hívásban:** `--lines 745-790 --lines 3850-3875`.
+- **`locate`/`map` kimeneti módok:** `--exact` (csak definíció és fájlnév), `--files` (soronként egy út),
+  `--json` (út, pontszám, indoklás).
+- **`find callers --json`:** közvetlen hívások JSON-ban (1. szint; mélyebbre a szöveges kimenet).
+- **`X::__construct` a `--grep`/`find callers` alatt:** a `new X` híváshelyeket is hozza.
 - **`find refs <Symbol>`:** a szimbólum minden említése, nem csak a hívási célok: `use`, `new`, `instanceof`,
   `catch`, `implements`/`extends`, `X::class`, `X::CONST`, property/paraméter/visszatérési típus, docblock és
   megjegyzés. `--kind use,new,…` szűrő, `--files` (soronként egy út, közvetlenül a `read`-hez), `--json`.

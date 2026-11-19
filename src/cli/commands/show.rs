@@ -266,18 +266,26 @@ impl ShowCommand {
             return Ok(FormatterRegistry::format_body(rows, self.body_mode));
         }
         if let Some(value) = &self.lines {
-            let Some((start, end)) = value.split_once('-') else {
-                return Err(crate::error::CallgraphError::Usage(lines_error(value)));
-            };
-            let Some(range) = start
-                .parse::<u32>()
-                .ok()
-                .zip(end.parse::<u32>().ok())
-                .filter(|(start, end)| *start > 0 && *end >= *start)
-            else {
-                return Err(crate::error::CallgraphError::Usage(lines_error(value)));
-            };
-            return FormatterRegistry::format_with("lines", rows, Some(range), None);
+            let mut out = String::new();
+            for part in value.split(',') {
+                let Some((start, end)) = part.split_once('-') else {
+                    return Err(crate::error::CallgraphError::Usage(lines_error(part)));
+                };
+                let Some(range) = start
+                    .parse::<u32>()
+                    .ok()
+                    .zip(end.parse::<u32>().ok())
+                    .filter(|(start, end)| *start > 0 && *end >= *start)
+                else {
+                    return Err(crate::error::CallgraphError::Usage(lines_error(part)));
+                };
+                let chunk = FormatterRegistry::format_with("lines", rows, Some(range), None)?;
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(&chunk);
+            }
+            return Ok(out);
         }
         if let Some(filter) = &self.strings {
             return FormatterRegistry::format_with("strings", rows, None, Some(filter));

@@ -36,6 +36,17 @@ fn callers_usage() -> &'static str {
     )
 }
 
+/// Несколько `--lines`: диапазоны склеиваются через запятую.
+fn push_range(lines: &mut Option<String>, value: String) {
+    match lines {
+        Some(existing) => {
+            existing.push(',');
+            existing.push_str(&value);
+        }
+        None => *lines = Some(value),
+    }
+}
+
 fn show_usage() -> &'static str {
     crate::t!(
         "callgraph show [--project <root>] [--label <name>] [--format <f>] [--body [--doc|--raw] [--refs]|--lines <n>-<m>|--strings <pattern>|--const <pattern>] [--grep <pattern>] [--category <cat,...>] [--depth N] [--guess] [--notes <pattern>] [--layer <name,...>] [--layers] [--by-layer] [--full] <path[::m]>...",
@@ -203,6 +214,9 @@ pub enum CliArgs {
     Locate {
         terms: Vec<String>,
         all: bool,
+        files: bool,
+        json: bool,
+        exact: bool,
         project: Option<String>,
     },
     /// `uses <csomag> [--calls]`: hol és hogyan használja a projekt egy függőségét; `calls`: fájlonként minden
@@ -266,6 +280,31 @@ pub enum CliArgs {
         classes: Vec<String>,
         project: Option<String>,
         json: bool,
+    },
+    /// `context <file>:<line> [-n N]`: строки вокруг места с границами метода.
+    Context {
+        target: String,
+        around: u32,
+        project: Option<String>,
+    },
+    /// `find callers --json`: машинный список прямых вызовов.
+    FindCallersJson {
+        name: String,
+        project: Option<String>,
+    },
+    /// `find path <glob>`: файлы по пути/имени.
+    FindPath {
+        glob: String,
+        json: bool,
+        project: Option<String>,
+    },
+    /// `find impl|sub|trait <Symbol>`: реализации, наследники, пользователи trait.
+    FindRelation {
+        relation: String,
+        symbol: String,
+        files: bool,
+        json: bool,
+        project: Option<String>,
     },
     /// `find text <pattern>`: текстовый поиск по не-AST файлам (neon, yaml, feature, env).
     FindText {
@@ -331,6 +370,7 @@ impl CliArgs {
             Some("read") => return Self::parse_read(&args[1..]),
             Some("find") => return Self::parse_find(&args[1..]),
             Some("skills") => return Self::parse_skills(&args[1..]),
+            Some("context") => return Self::parse_context(&args[1..]),
             Some("flow") if args.get(1).map(String::as_str) != Some("map") => {
                 return Self::parse_trace(&args[1..]);
             }
@@ -504,11 +544,7 @@ impl CliArgs {
                 out.extend(rest.iter().cloned());
                 Self::parse_locate(&out)
             }
-            "callers" => {
-                let mut out = vec![".".to_owned()];
-                out.extend_from_slice(&Self::with_flag(rest, "--grep")?);
-                Self::parse_show(&out)
-            }
+            "callers" => Self::parse_find_callers(rest),
             "string" => {
                 let mut out = vec![".".to_owned()];
                 out.extend_from_slice(&Self::with_flag(rest, "--strings")?);
@@ -521,8 +557,125 @@ impl CliArgs {
             }
             "refs" => Self::parse_find_refs(rest),
             "text" => Self::parse_find_text(rest),
+            "path" => Self::parse_find_path(rest),
+            "impl" | "sub" | "trait" => Self::parse_find_relation(action, rest),
             _ => Err(CallgraphError::Usage(Self::find_usage().into())),
         }
+    }
+
+    /// `find callers <name> [--depth N] [--json] [--project X]`.
+    fn parse_find_callers(args: &[String]) -> Result<Self> {
+        let json = args.iter().any(|arg| arg == "--json");
+        let mut depth = 1usize;
+        let mut i = 0;
+        while i < args.len() {
+            if args[i] == "--depth" && i + 1 < args.len() {
+                depth = args[i + 1].parse().unwrap_or(1);
+                i += 2;
+                continue;
+            }
+            if let Some(value) = args[i].strip_prefix("--depth=") {
+                depth = value.parse().unwrap_or(1);
+            }
+            i += 1;
+        }
+        if !json {
+            let mut out = vec![".".to_owned()];
+            out.extend_from_slice(&Self::with_flag(args, "--grep")?);
+            return Self::parse_show(&out);
+        }
+        if depth > 1 {
+            return Err(CallgraphError::Usage(
+                crate::t!(
+                    "find callers --json supports --depth 1 only (use the text output for deeper levels)",
+                    "a find callers --json csak --depth 1-et támogat (mélyebb szintekhez a szöveges kimenet)"
+                )
+                .into(),
+            ));
+        }
+        let usage = || CallgraphError::Usage(Self::find_usage().into());
+        let mut name = None;
+        let mut project = None;
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--json" => {}
+                "--depth" => i += 1,
+                "--project" if i + 1 < args.len() => {
+                    project = Some(args[i + 1].clone());
+                    i += 1;
+                }
+                x if x.starts_with("--project=") => project = Some(x[10..].to_owned()),
+                x if x.starts_with('-') && x.len() > 1 => return Err(usage()),
+                x if name.is_none() => name = Some(x.to_owned()),
+                _ => return Err(usage()),
+            }
+            i += 1;
+        }
+        Ok(Self::FindCallersJson {
+            name: name.ok_or_else(usage)?,
+            project,
+        })
+    }
+
+    /// `find path <glob> [--json] [--project X]`.
+    fn parse_find_path(args: &[String]) -> Result<Self> {
+        let usage = || CallgraphError::Usage(Self::find_usage().into());
+        let mut glob = None;
+        let mut json = false;
+        let mut project = None;
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--json" => json = true,
+                "--project" if i + 1 < args.len() => {
+                    project = Some(args[i + 1].clone());
+                    i += 1;
+                }
+                x if x.starts_with("--project=") => project = Some(x[10..].to_owned()),
+                x if x.starts_with('-') && x.len() > 1 => return Err(usage()),
+                x if glob.is_none() => glob = Some(x.to_owned()),
+                _ => return Err(usage()),
+            }
+            i += 1;
+        }
+        Ok(Self::FindPath {
+            glob: glob.ok_or_else(usage)?,
+            json,
+            project,
+        })
+    }
+
+    /// `find impl|sub|trait <Symbol> [--files] [--json] [--project X]`.
+    fn parse_find_relation(action: &str, args: &[String]) -> Result<Self> {
+        let usage = || CallgraphError::Usage(Self::find_usage().into());
+        let mut symbol = None;
+        let mut files = false;
+        let mut json = false;
+        let mut project = None;
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--files" => files = true,
+                "--json" => json = true,
+                "--project" if i + 1 < args.len() => {
+                    project = Some(args[i + 1].clone());
+                    i += 1;
+                }
+                x if x.starts_with("--project=") => project = Some(x[10..].to_owned()),
+                x if x.starts_with('-') && x.len() > 1 => return Err(usage()),
+                x if symbol.is_none() => symbol = Some(x.to_owned()),
+                _ => return Err(usage()),
+            }
+            i += 1;
+        }
+        Ok(Self::FindRelation {
+            relation: action.to_owned(),
+            symbol: symbol.ok_or_else(usage)?,
+            files,
+            json,
+            project,
+        })
     }
 
     /// `find text <pattern> [--glob '*.neon,*.yaml'] [--files] [--json] [--project X]`.
@@ -659,6 +812,47 @@ impl CliArgs {
         Ok(Self::Skills { full })
     }
 
+    /// `context <file>:<line> [-n N] [--project X]`.
+    fn parse_context(args: &[String]) -> Result<Self> {
+        let usage = || CallgraphError::Usage(Self::context_usage().into());
+        let mut target = None;
+        let mut around = 5;
+        let mut project = None;
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "-n" | "--context" if i + 1 < args.len() => {
+                    around = args[i + 1].parse().map_err(|_| usage())?;
+                    i += 1;
+                }
+                x if x.starts_with("--context=") => {
+                    around = x[10..].parse().map_err(|_| usage())?;
+                }
+                "--project" if i + 1 < args.len() => {
+                    project = Some(args[i + 1].clone());
+                    i += 1;
+                }
+                x if x.starts_with("--project=") => project = Some(x[10..].to_owned()),
+                x if x.starts_with('-') && x.len() > 1 => return Err(usage()),
+                x if target.is_none() => target = Some(x.to_owned()),
+                _ => return Err(usage()),
+            }
+            i += 1;
+        }
+        Ok(Self::Context {
+            target: target.ok_or_else(usage)?,
+            around,
+            project,
+        })
+    }
+
+    fn context_usage() -> &'static str {
+        crate::t!(
+            "callgraph context <file>:<line> [-n N] [--project <alias|dir>]",
+            "callgraph context <fájl>:<sor> [-n N] [--project <alias|mappa>]"
+        )
+    }
+
     fn read_usage() -> &'static str {
         crate::t!(
             "callgraph read <path[::method]> [--body|--api|--flow|--lines N-M] [--project <alias|dir>]  (file: outline, file::method: body with type footnotes)",
@@ -668,8 +862,8 @@ impl CliArgs {
 
     fn find_usage() -> &'static str {
         crate::t!(
-            "callgraph find <def|callers|string|const|refs|text> <value> [--depth N] [--kind …] [--files] [--project <alias|dir>]",
-            "callgraph find <def|callers|string|const|refs|text> <érték> [--depth N] [--kind …] [--files] [--project <alias|mappa>]"
+            "callgraph context <file>:<line> [-n N] | callgraph find <def|callers|string|const|refs|text|path|impl|sub|trait> <value> [--depth N] [--kind …] [--files] [--project <alias|dir>]",
+            "callgraph context <fájl>:<sor> [-n N] | callgraph find <def|callers|string|const|refs|text|path|impl|sub|trait> <érték> [--depth N] [--kind …] [--files] [--project <alias|mappa>]"
         )
     }
 
@@ -775,11 +969,11 @@ impl CliArgs {
                     i += 1;
                 }
                 "--lines" if i + 1 < args.len() => {
-                    lines = Some(args[i + 1].clone());
+                    push_range(&mut lines, args[i + 1].clone());
                     i += 2;
                 }
                 x if x.starts_with("--lines=") => {
-                    lines = Some(x[8..].to_owned());
+                    push_range(&mut lines, x[8..].to_owned());
                     i += 1;
                 }
                 "--strings" if i + 1 < args.len() => {
@@ -1107,6 +1301,9 @@ impl CliArgs {
         let mut terms = Vec::new();
         let mut project = None;
         let mut all = false;
+        let mut files = false;
+        let mut json = false;
+        let mut exact = false;
         let mut i = 0;
         while i < args.len() {
             match args[i].as_str() {
@@ -1115,6 +1312,9 @@ impl CliArgs {
                     break;
                 }
                 "--all" => all = true,
+                "--files" => files = true,
+                "--json" => json = true,
+                "--exact" => exact = true,
                 "--project" if i + 1 < args.len() => {
                     project = Some(args[i + 1].clone());
                     i += 1;
@@ -1136,6 +1336,9 @@ impl CliArgs {
         Ok(Self::Locate {
             terms,
             all,
+            files,
+            json,
+            exact,
             project,
         })
     }
@@ -1620,6 +1823,9 @@ mod tests {
             CliArgs::Locate {
                 terms: vec!["RefundController".into(), "refund".into()],
                 all: true,
+                files: false,
+                json: false,
+                exact: false,
                 project: Some("sp".into()),
             }
         );
@@ -1628,6 +1834,9 @@ mod tests {
             CliArgs::Locate {
                 terms: vec!["-odd".into()],
                 all: false,
+                files: false,
+                json: false,
+                exact: false,
                 project: Some("/x".into()),
             }
         );
@@ -1639,6 +1848,9 @@ mod tests {
             CliArgs::Locate {
                 terms: vec!["--orange-500".into(), "x".into()],
                 all: true,
+                files: false,
+                json: false,
+                exact: false,
                 project: None,
             }
         );
